@@ -51,4 +51,6 @@ void bcachefs_usage(void);
 int fs_cmds(int argc, char *argv[]);
 int subvolume_cmds(int argc, char *argv[]);
 
+int cmd_recover_files(int argc, char *argv[]);
+
 #endif /* _CMDS_H */

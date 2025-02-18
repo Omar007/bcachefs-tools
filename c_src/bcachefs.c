@@ -42,6 +42,7 @@ void bcachefs_usage(void)
 	     "\n"
 	     "Repair:\n"
 	     "  fsck                     Check an existing filesystem for errors\n"
+	     "  recover-files            Attempt to recover deleted files using the journal\n"
 	     "\n"
 #if 0
 	     "Startup/shutdown, assembly of multi device filesystems:\n"
