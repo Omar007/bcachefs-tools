@@ -16,6 +16,13 @@ struct recover_settings {
 	bool ignore_csum;
 	bool zero_fill;
 	bool use_last;
+	u64 extents_total;
+	u64 extents_written;
+	u64 extents_failed;
+	u64 extents_csum;
+	u64 extents_decompress;
+	u64 files_names;
+	u64 files_inodes;
 };
 
 struct recover_context {
@@ -23,6 +30,11 @@ struct recover_context {
 	u64 size;
 	u64 offset;
 	void *data;
+	struct bio *bio;
+	struct bkey_i *key;
+	struct bch_io_failures *failed;
+	bool failed_csum;
+	bool failed_decompress;
 };
 
 static void recover_files_usage(void)
@@ -81,7 +93,7 @@ static bool is_inode_rm_transaction(struct jset_entry *entry)
 	return is_transaction(entry, "bch2_inode_rm");
 }
 
-static int recover_unlink_data(struct recover_settings *settings, struct bkey_i *key)
+static int recover_unlink_details(struct recover_settings *settings, struct bkey_i *key)
 {
 	if (key->k.type != KEY_TYPE_dirent) {
 		return 0;
@@ -111,7 +123,7 @@ static int recover_unlink_data(struct recover_settings *settings, struct bkey_i 
 	if (symlink(targetName, filename) < 0) {
 		if (errno == EEXIST) {
 			printf("%s already exists. Skipping symlink creation.\n", filename);
-			return 0;
+			goto done;
 		} else {
 			printf("Failed to create helper symlink %s: %d\n", filename, errno);
 			return -1;
@@ -119,6 +131,9 @@ static int recover_unlink_data(struct recover_settings *settings, struct bkey_i 
 	}
 
 	printf("Symlink created: %s -> %s\n", filename, targetName);
+
+done:
+	settings->files_names++;
 	return 0;
 }
 
@@ -158,13 +173,18 @@ static int write_to_recovery_file(struct recover_settings *settings, struct reco
 	close(fd);
 
 	printf("Extent written to file.\n");
+
+	settings->extents_written++;
 	return 0;
 }
 
-static int recovery_read_endio(struct recover_settings *settings, struct bch_fs *fs,
-	struct bio *orig, struct bio *read_bio, struct bkey_i *key, struct extent_ptr_decoded *pick,
-	struct bch_io_failures *failed)
+static int recovery_read_endio(struct recover_settings *settings, struct recover_context *ctx,
+	struct bch_fs *fs, struct bio *read_bio, struct extent_ptr_decoded *pick)
 {
+	struct bio *orig = ctx->bio;
+	struct bch_io_failures *failed = ctx->failed;
+	struct bkey_i *key = ctx->key;
+
 	struct nonce nonce = extent_nonce(key->k.bversion, pick->crc);
 
 	if (orig != read_bio) {
@@ -175,8 +195,8 @@ static int recovery_read_endio(struct recover_settings *settings, struct bch_fs 
 
 	printf("Verifying checksum...\n");
 	struct bch_csum csum = bch2_checksum_bio(fs, pick->crc.csum_type, nonce, read_bio);
-	bool csum_invalid = bch2_crc_cmp(csum, pick->crc.csum);
-	if (csum_invalid) {
+	ctx->failed_csum = bch2_crc_cmp(csum, pick->crc.csum);
+	if (ctx->failed_csum) {
 		struct printbuf buf = PRINTBUF;
 		bch2_csum_err_msg(&buf, pick->crc.csum_type, pick->crc.csum, csum);
 		printf("%s\n", buf.buf);
@@ -195,7 +215,8 @@ static int recovery_read_endio(struct recover_settings *settings, struct bch_fs 
 		}
 
 		printf("Decompressing extent...\n");
-		if (bch2_bio_uncompress(fs, read_bio, orig, orig->bi_iter, pick->crc)) {
+		ctx->failed_decompress = bch2_bio_uncompress(fs, read_bio, orig, orig->bi_iter, pick->crc);
+		if (ctx->failed_decompress) {
 			printf("Failed to decompress extent.\n");
 			goto retry;
 		}
@@ -213,17 +234,20 @@ static int recovery_read_endio(struct recover_settings *settings, struct bch_fs 
 	return 0;
 
 retry:
-	bch2_mark_io_failure(failed, pick, csum_invalid);
+	bch2_mark_io_failure(failed, pick, ctx->failed_csum);
 	if (orig != read_bio) {
 		bch2_bio_free_pages_pool(fs, read_bio);
 		bio_put(read_bio);
 	}
-	return 1;
+	return failed->nr;
 }
 
-static int recovery_read_extent(struct recover_settings *settings, struct bch_fs *fs,
-	struct bkey_i *key, struct bio *orig, struct bch_io_failures *failed)
+static int recovery_read_extent(struct recover_settings *settings, struct recover_context *ctx, struct bch_fs *fs)
 {
+	struct bio *orig = ctx->bio;
+	struct bch_io_failures *failed = ctx->failed;
+	struct bkey_i *key = ctx->key;
+
 	struct bkey_s_c s_c = bkey_i_to_s_c(key);
 
 	if (bkey_extent_is_inline_data(&key->k)) {
@@ -239,6 +263,15 @@ static int recovery_read_extent(struct recover_settings *settings, struct bch_fs
 	struct extent_ptr_decoded pick;
 	if (bch2_bkey_pick_read_device(fs, s_c, failed, &pick, -1) < 0) {
 		printf("No device to read from.\n");
+
+		settings->extents_failed++;
+		if (ctx->failed_csum) {
+			settings->extents_csum++;
+		}
+		if (ctx->failed_decompress) {
+			settings->extents_decompress++;
+		}
+
 		if (settings->zero_fill) {
 			printf("Zero-filling...\n");
 			zero_fill_bio_iter(orig, orig->bi_iter);
@@ -273,9 +306,9 @@ static int recovery_read_extent(struct recover_settings *settings, struct bch_fs
 	bio_set_dev(read_bio, dev->disk_sb.bdev);
 	submit_bio_wait(read_bio);
 
-	if (recovery_read_endio(settings, fs, orig, read_bio, key, &pick, failed) > 0) {
+	if (recovery_read_endio(settings, ctx, fs, read_bio, &pick) > 0) {
 		printf("Read failed. Retrying...\n");
-		return recovery_read_extent(settings, fs, key, orig, failed);
+		return recovery_read_extent(settings, ctx, fs);
 	}
 
 	return 0;
@@ -284,6 +317,7 @@ static int recovery_read_extent(struct recover_settings *settings, struct bch_fs
 static int recover_inode_data(struct recover_settings *settings, struct bch_fs *fs, struct bkey_i *key)
 {
 	assert(bkey_extent_is_data(&key->k));
+	settings->extents_total++;
 
 	struct printbuf buf = PRINTBUF;
 	bch2_bkey_val_to_text(&buf, fs, bkey_i_to_s_c(key));
@@ -311,20 +345,24 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 	bio_add_page(bio, vmalloc_to_page(data), size, 0);
 
 	struct bch_io_failures failed = { .nr = 0 };
-	if (recovery_read_extent(settings, fs, key, bio, &failed) < 0) {
+	struct recover_context ctx = {
+		.inode = le64_to_cpu(key->k.p.inode),
+		.size = size,
+		// Offset denotes the /end sector/ so calculate backwards using size.
+		.offset = (le64_to_cpu(key->k.p.offset) - le32_to_cpu(key->k.size)) * 512,
+		.data = data,
+		.bio = bio,
+		.key = key,
+		.failed = &failed,
+		.failed_csum = false,
+	};
+	if (recovery_read_extent(settings, &ctx, fs) < 0) {
 		printf("Failed to read extent data.\n");
 		return -1;
 	}
 
 	assert(bio->bi_status == 0);
 
-	struct recover_context ctx = {
-		.inode = le64_to_cpu(key->k.p.inode),
-		.size = size,
-		// Offset denotes the /end sector/ so calculate backwards using size.
-		.offset = (le64_to_cpu(key->k.p.offset) - le32_to_cpu(key->k.size)) * 512,
-		.data = data
-	};
 	int rc = write_to_recovery_file(settings, &ctx);
 	bio_put(bio);
 	free(data);
@@ -360,6 +398,7 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 
 	printf("File truncated!\n");
 
+	settings->files_inodes++;
 	return 0;
 }
 
@@ -374,7 +413,7 @@ static int do_recover_files(struct recover_settings *settings, struct bch_fs *fs
 			continue;
 		}
 
-		printf("Processing journal entry %llu for recovery...\n", le64_to_cpu(p->j.seq));
+		printf("Processing journal entry %llu...\n", le64_to_cpu(p->j.seq));
 
 		bool processing_unlink_transaction = false;
 		bool processing_inode_rm_transaction = false;
@@ -382,9 +421,6 @@ static int do_recover_files(struct recover_settings *settings, struct bch_fs *fs
 			if (entry_is_transaction_start(entry)) {
 				processing_unlink_transaction = is_unlink_transaction(entry);
 				processing_inode_rm_transaction = is_inode_rm_transaction(entry);
-				if (processing_unlink_transaction || processing_inode_rm_transaction) {
-					printf("Found eligable transaction! Checking contents...\n");
-				}
 				continue;
 			}
 
@@ -394,7 +430,7 @@ static int do_recover_files(struct recover_settings *settings, struct bch_fs *fs
 
 			jset_entry_for_each_key(entry, key) {
 				if (processing_unlink_transaction) {
-					if (recover_unlink_data(settings, key) < 0) {
+					if (recover_unlink_details(settings, key) < 0) {
 						return -1;
 					}
 				}
@@ -447,7 +483,14 @@ int cmd_recover_files(int argc, char *argv[])
 		.end_time = 0,
 		.ignore_csum = false,
 		.zero_fill = false,
-		.use_last = false
+		.use_last = false,
+		.extents_total = 0,
+		.extents_written = 0,
+		.extents_failed = 0,
+		.extents_csum = 0,
+		.extents_decompress = 0,
+		.files_names = 0,
+		.files_inodes = 0,
 	};
 
 	int opt;
@@ -501,6 +544,16 @@ int cmd_recover_files(int argc, char *argv[])
 	if (rc < 0) {
 		printf("Problem encountered during recovery. Aborted.\n");
 	}
+
+	printf("Found %llu extents:\n", settings.extents_total);
+	printf("  - %llu extents recovered and written\n", settings.extents_written);
+	printf("  - %llu extents with read failures\n", settings.extents_failed);
+	if (settings.extents_failed > 0) {
+		printf("    - %llu extents with csum failures\n", settings.extents_csum);
+		printf("    - %llu extents with decompress failures\n", settings.extents_decompress);
+	}
+	printf("  - %llu file names recovered\n", settings.files_names);
+	printf("  - %llu file metadata recovered\n", settings.files_inodes);
 
 	bch2_fs_stop(c);
 	bch2_darray_str_exit(&devs);
