@@ -16,6 +16,9 @@ struct recover_settings {
 	bool ignore_csum;
 	bool zero_fill;
 	bool use_last;
+	bool scan_bset;
+	bool scan_jset;
+	bool use_journal;
 	bool verbose;
 	u64 extents_total;
 	u64 extents_written;
@@ -46,11 +49,14 @@ static void recover_files_usage(void)
 	     "Options:\n"
 	     "  -t, --target-dir      Target directory to place the recovered files in. USE A LOCATION ON A DIFFERENT FILESYSTEM!\n"
 	     "                        Fail to do so and risk destroying the data you're trying to recover!\n"
-	     "  -s, --start-time      The time (in Unix time) after which deleted data should be recovered.\n"
-	     "  -e, --end-time        The time (in Unix time) before which deleted data should be recovered.\n"
+	     "  -s, --start-time      The time (in Unix time) after which deleted data should be recovered (if detectable).\n"
+	     "  -e, --end-time        The time (in Unix time) before which deleted data should be recovered (if detectable).\n"
 	     "  -i, --ignore-csum     Ignore checksum failures and accept the data as-is.\n"
 	     "  -z, --zero-fill       Zero fill extent data if it can not (reliably) be read instead of bailing out.\n"
 	     "  -l, --use-last        Write out last read extent data if it can not (reliably) be read instead of bailing out.\n"
+	     "  -B, --scan-bset       Scan each member disk for extent data. Slow but should recover as much as possible.\n"
+	     "  -J, --scan-jset       Scan each member disk for journal data. Should recover a good amount.\n"
+	     "  -j, --use-journal     Use the live journal for data recovery. Quick but less complete.\n"
 	     "  -v, --verbose         Enable verbose mode for disk operations.\n"
 	     "  -h, --help            Display this help and exit.\n"
 	     "Report bugs to <linux-bcachefs@vger.kernel.org>");
@@ -475,9 +481,55 @@ static int do_journal_recovery(struct recover_settings *settings, struct bch_fs 
 	return 0;
 }
 
+static int scan_member(struct recover_settings *settings, struct bch_dev *dev, u64 magic)
+{
+	return printf("%d: %llu\n", dev->dev_idx, magic);
+}
+
+static int do_bset_recovery(struct recover_settings *settings, struct bch_fs *fs)
+{
+	for_each_online_member(fs, dev, 0) {
+		if (scan_member(settings, dev, __bset_magic(dev->disk_sb.sb)) < 0) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int do_jset_recovery(struct recover_settings *settings, struct bch_fs *fs)
+{
+	for_each_online_member(fs, dev, 0) {
+		if (scan_member(settings, dev, __jset_magic(dev->disk_sb.sb)) < 0) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
 static int do_recover_files(struct recover_settings *settings, struct bch_fs *fs)
 {
-	return do_journal_recovery(settings, fs);
+	if (settings->scan_bset) {
+		printf("Scanning disks for bsets...\n");
+		if (do_bset_recovery(settings, fs) < 0) {
+			return -1;
+		}
+	}
+
+	if (settings->scan_jset) {
+		printf("Scanning disks for jsets...\n");
+		if (do_jset_recovery(settings, fs) < 0) {
+			return -1;
+		}
+	}
+
+	if (settings->use_journal) {
+		printf("Reading journal...\n");
+		if (do_journal_recovery(settings, fs) < 0) {
+			return -1;
+		}
+	}
+
+	return 0;
 }
 
 int cmd_recover_files(int argc, char *argv[])
@@ -489,20 +541,13 @@ int cmd_recover_files(int argc, char *argv[])
 		{ "ignore-csum", no_argument, NULL, 'i' },
 		{ "zero-fill", no_argument, NULL, 'z' },
 		{ "use-last", no_argument, NULL, 'l' },
+		{ "scan-bset", no_argument, NULL, 'b' },
+		{ "scan-jset", no_argument, NULL, 'b' },
+		{ "use-journal", no_argument, NULL, 'j' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL }
 	};
-
-	struct bch_opts opts = bch2_opts_empty();
-	opt_set(opts, noexcl, true);
-	opt_set(opts, nochanges, true);
-	opt_set(opts, norecovery, true);
-	opt_set(opts, read_only, true);
-	opt_set(opts, degraded, BCH_DEGRADED_yes);
-	opt_set(opts, retain_recovery_info, true);
-	opt_set(opts, read_journal_only, true);
-	opt_set(opts, read_entire_journal, true);
 
 	struct recover_settings settings = {
 		.target_dir = NULL,
@@ -511,6 +556,9 @@ int cmd_recover_files(int argc, char *argv[])
 		.ignore_csum = false,
 		.zero_fill = false,
 		.use_last = false,
+		.scan_bset = false,
+		.scan_jset = false,
+		.use_journal = false,
 		.verbose = false,
 		.extents_total = 0,
 		.extents_written = 0,
@@ -522,7 +570,7 @@ int cmd_recover_files(int argc, char *argv[])
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "t:s:e:izlvh", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "t:s:e:izlBJjvh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 't':
 			settings.target_dir = strdup(optarg);
@@ -544,8 +592,16 @@ int cmd_recover_files(int argc, char *argv[])
 		case 'l':
 			settings.use_last = true;
 			break;
+		case 'B':
+			settings.scan_bset = true;
+			break;
+		case 'J':
+			settings.scan_jset = true;
+			break;
+		case 'j':
+			settings.use_journal = true;
+			break;
 		case 'v':
-			opt_set(opts, verbose, true);
 			settings.verbose = true;
 			break;
 		case 'h':
@@ -558,9 +614,24 @@ int cmd_recover_files(int argc, char *argv[])
 		die("Please supply a target directory");
 	}
 
+	if (!settings.scan_bset && !settings.scan_jset && !settings.use_journal) {
+		die("Please select recovery method(s)");
+	}
+
 	if (!argc) {
 		die("Please supply device(s) to open");
 	}
+
+	struct bch_opts opts = bch2_opts_empty();
+	opt_set(opts, noexcl, true);
+	opt_set(opts, nochanges, true);
+	opt_set(opts, norecovery, true);
+	opt_set(opts, read_only, true);
+	opt_set(opts, degraded, BCH_DEGRADED_yes);
+	opt_set(opts, retain_recovery_info, true);
+	opt_set(opts, read_journal_only, true);
+	opt_set(opts, read_entire_journal, settings.use_journal);
+	opt_set(opts, verbose, settings.verbose);
 
 	darray_str devs = get_or_split_cmdline_devs(argc, argv);
 	struct bch_fs *c = bch2_fs_open(devs.data, devs.nr, opts);
