@@ -412,7 +412,52 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 	return 0;
 }
 
-static int do_recover_files(struct recover_settings *settings, struct bch_fs *fs)
+static int process_journal_replay(struct recover_settings *settings, struct bch_fs *fs, struct journal_replay *jr)
+{
+	bool processing_unlink_transaction = false;
+	bool processing_inode_rm_transaction = false;
+
+	verbose(settings, "Processing journal entry %llu...\n", le64_to_cpu(jr->j.seq));
+
+	for (struct jset_entry *entry = jr->j.start; entry != vstruct_last(&jr->j); entry = vstruct_next(entry)) {
+		if (entry_is_transaction_start(entry)) {
+			processing_unlink_transaction = is_unlink_transaction(entry);
+			processing_inode_rm_transaction = is_inode_rm_transaction(entry);
+			continue;
+		}
+
+		if ((!processing_unlink_transaction && !processing_inode_rm_transaction) || entry->type != BCH_JSET_ENTRY_overwrite) {
+			continue;
+		}
+
+		jset_entry_for_each_key(entry, key) {
+			if (processing_unlink_transaction) {
+				if (recover_unlink_details(settings, key) < 0) {
+					return -1;
+				}
+			}
+
+			if (processing_inode_rm_transaction) {
+				if (bkey_extent_is_data(&key->k)) {
+					if (recover_inode_data(settings, fs, key) < 0) {
+						struct printbuf buf = PRINTBUF;
+						bch2_bkey_val_to_text(&buf, fs, bkey_i_to_s_c(key));
+						printf("ERROR: problem while processing extent: %s\n", buf.buf);
+						printbuf_exit(&buf);
+						return -1;
+					}
+				} else if (bkey_is_inode(&key->k)) {
+					if (recover_inode_details(settings, fs, key) < 0) {
+						return -1;
+					}
+				}
+			}
+		}
+	}
+	return 0;
+}
+
+static int do_journal_recovery(struct recover_settings *settings, struct bch_fs *fs)
 {
 	struct journal_replay *p, **_p;
 	struct genradix_iter iter;
@@ -423,47 +468,16 @@ static int do_recover_files(struct recover_settings *settings, struct bch_fs *fs
 			continue;
 		}
 
-		verbose(settings, "Processing journal entry %llu...\n", le64_to_cpu(p->j.seq));
-
-		bool processing_unlink_transaction = false;
-		bool processing_inode_rm_transaction = false;
-		for (struct jset_entry *entry = p->j.start; entry != vstruct_last(&p->j); entry = vstruct_next(entry)) {
-			if (entry_is_transaction_start(entry)) {
-				processing_unlink_transaction = is_unlink_transaction(entry);
-				processing_inode_rm_transaction = is_inode_rm_transaction(entry);
-				continue;
-			}
-
-			if ((!processing_unlink_transaction && !processing_inode_rm_transaction) || entry->type != BCH_JSET_ENTRY_overwrite) {
-				continue;
-			}
-
-			jset_entry_for_each_key(entry, key) {
-				if (processing_unlink_transaction) {
-					if (recover_unlink_details(settings, key) < 0) {
-						return -1;
-					}
-				}
-
-				if (processing_inode_rm_transaction) {
-					if (bkey_extent_is_data(&key->k)) {
-						if (recover_inode_data(settings, fs, key) < 0) {
-							struct printbuf buf = PRINTBUF;
-							bch2_bkey_val_to_text(&buf, fs, bkey_i_to_s_c(key));
-							printf("ERROR: problem while processing extent: %s\n", buf.buf);
-							printbuf_exit(&buf);
-							return -1;
-						}
-					} else if (bkey_is_inode(&key->k)) {
-						if (recover_inode_details(settings, fs, key) < 0) {
-							return -1;
-						}
-					}
-				}
-			}
+		if (process_journal_replay(settings, fs, p) < 0) {
+			return -1;
 		}
 	}
 	return 0;
+}
+
+static int do_recover_files(struct recover_settings *settings, struct bch_fs *fs)
+{
+	return do_journal_recovery(settings, fs);
 }
 
 int cmd_recover_files(int argc, char *argv[])
