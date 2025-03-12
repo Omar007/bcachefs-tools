@@ -2,12 +2,14 @@
 
 #include "cmds.h"
 
+#include "libbcachefs/buckets.h"
 #include "libbcachefs/dirent.h"
 #include "libbcachefs/io_read.h"
 #include "libbcachefs/io_write.h"
 #include "libbcachefs/journal_io.h"
 #include "libbcachefs/sb-members.h"
 #include "libbcachefs/super.h"
+#include "libbcachefs/super-io.h"
 
 struct recover_settings {
 	char *target_dir;
@@ -418,14 +420,14 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 	return 0;
 }
 
-static int process_journal_replay(struct recover_settings *settings, struct bch_fs *fs, struct journal_replay *jr)
+static int process_jset(struct recover_settings *settings, struct bch_fs *fs, struct jset *jset)
 {
 	bool processing_unlink_transaction = false;
 	bool processing_inode_rm_transaction = false;
 
-	verbose(settings, "Processing journal entry %llu...\n", le64_to_cpu(jr->j.seq));
+	verbose(settings, "Processing journal entry %llu...\n", le64_to_cpu(jset->seq));
 
-	for (struct jset_entry *entry = jr->j.start; entry != vstruct_last(&jr->j); entry = vstruct_next(entry)) {
+	for (struct jset_entry *entry = jset->start; entry != vstruct_last(jset); entry = vstruct_next(entry)) {
 		if (entry_is_transaction_start(entry)) {
 			processing_unlink_transaction = is_unlink_transaction(entry);
 			processing_inode_rm_transaction = is_inode_rm_transaction(entry);
@@ -474,50 +476,91 @@ static int do_journal_recovery(struct recover_settings *settings, struct bch_fs 
 			continue;
 		}
 
-		if (process_journal_replay(settings, fs, p) < 0) {
+		if (process_jset(settings, fs, &p->j) < 0) {
 			return -1;
 		}
 	}
 	return 0;
 }
 
-static int scan_member(struct recover_settings *settings, struct bch_dev *dev, u64 magic)
+// Copied over from journal_io.c
+static struct nonce journal_nonce(const struct jset *jset)
 {
-	return printf("%d: %llu\n", dev->dev_idx, magic);
+	return (struct nonce) {{
+		[0] = 0,
+		[1] = ((__le32 *) &jset->seq)[0],
+		[2] = ((__le32 *) &jset->seq)[1],
+		[3] = BCH_NONCE_JOURNAL,
+	}};
 }
 
-static int do_bset_recovery(struct recover_settings *settings, struct bch_fs *fs)
+static int scan_members(struct recover_settings *settings, struct bch_fs *fs)
 {
-	for_each_online_member(fs, dev, 0) {
-		if (scan_member(settings, dev, __bset_magic(dev->disk_sb.sb)) < 0) {
-			return -1;
-		}
-	}
-	return 0;
-}
+	u64 fs_magic_jset = jset_magic(fs);
 
-static int do_jset_recovery(struct recover_settings *settings, struct bch_fs *fs)
-{
 	for_each_online_member(fs, dev, 0) {
-		if (scan_member(settings, dev, __jset_magic(dev->disk_sb.sb)) < 0) {
+		// The bucket_size field records size in 512 sector counts.
+		u64 bsize_in_bytes = dev->mi.bucket_size * 512;
+
+		verbose(settings, "Processing member %d: buckets=%llu, bsize=%llu\n", dev->dev_idx, dev->mi.nbuckets, bsize_in_bytes);
+
+		void *data = vzalloc(bsize_in_bytes);
+		if (!data) {
+			printf("ERROR: unable to allocate memory for bucket data.\n");
 			return -1;
 		}
+
+		struct bio *bio = bio_alloc_bioset(NULL, 1, REQ_OP_READ|REQ_SYNC, GFP_NOFS, &fs->bio_read);
+		if (!bio) {
+			printf("ERROR: unable to allocate BIO for read.\n");
+			return -1;
+		}
+
+		for (u64 bucket = 0; bucket < dev->mi.nbuckets; bucket++) {
+			bio_reset(bio, dev->disk_sb.bdev, REQ_OP_READ|REQ_SYNC);
+			memset(data, 0, bsize_in_bytes);
+			bio_add_page(bio, vmalloc_to_page(data), bsize_in_bytes, 0);
+
+			bio->bi_iter.bi_sector = bucket_to_sector(dev, bucket);
+			submit_bio_wait(bio);
+
+			assert(bio->bi_status == 0);
+
+			void *data_iter = data;
+			for (u16 sector = 0; sector < dev->mi.bucket_size; sector++) {
+				if (settings->scan_jset) {
+					struct jset *jset = data_iter;
+					if (le64_to_cpu(jset->magic) == fs_magic_jset) {
+						verbose(settings, "Found jset: sector=%llu, bucket=%d\n", bucket_to_sector(dev, bucket) + sector, bucket);
+
+						if (!settings->ignore_csum && bch2_crc_cmp(jset->csum, csum_vstruct(fs, JSET_CSUM_TYPE(jset), journal_nonce(jset), jset))) {
+							printf("ERROR: failed to verify jset checksum.\n");
+							return -1;
+						}
+
+						if (should_recover(settings, jset) && process_jset(settings, fs, jset) < 0) {
+							printf("ERROR: Failed to process jset.\n");
+							return -1;
+						}
+
+						data_iter = data_iter + (vstruct_sectors(jset, fs->block_bits) << 9);
+					}
+				}
+			}
+		}
+
+		bio_put(bio);
+		free(data);
 	}
+
 	return 0;
 }
 
 static int do_recover_files(struct recover_settings *settings, struct bch_fs *fs)
 {
-	if (settings->scan_bset) {
-		printf("Scanning disks for bsets...\n");
-		if (do_bset_recovery(settings, fs) < 0) {
-			return -1;
-		}
-	}
-
-	if (settings->scan_jset) {
-		printf("Scanning disks for jsets...\n");
-		if (do_jset_recovery(settings, fs) < 0) {
+	if (settings->scan_bset || settings->scan_jset) {
+		printf("Scanning member disks...\n");
+		if (scan_members(settings, fs) < 0) {
 			return -1;
 		}
 	}
