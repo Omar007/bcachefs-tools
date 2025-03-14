@@ -224,18 +224,14 @@ static int recovery_read_endio(struct recover_settings *settings, struct recover
 
 	verbose(settings, "Verifying checksum...\n");
 	struct bch_csum csum = bch2_checksum_bio(fs, pick->crc.csum_type, nonce, read_bio);
-	ctx->failed_csum = bch2_crc_cmp(csum, pick->crc.csum);
+	ctx->failed_csum = bch2_crc_cmp(pick->crc.csum, csum);
 	if (ctx->failed_csum) {
-		if (settings->verbose) {
-			struct printbuf buf = PRINTBUF;
-			bch2_csum_err_msg(&buf, pick->crc.csum_type, pick->crc.csum, csum);
-			printf("%s\n", buf.buf);
-			printbuf_exit(&buf);
-		}
+		struct printbuf buf = PRINTBUF;
+		bch2_csum_err_msg(&buf, pick->crc.csum_type, pick->crc.csum, csum);
+		printf("%s\n", buf.buf);
+		printbuf_exit(&buf);
 
-		if (!settings->ignore_csum) {
-			goto retry;
-		}
+		goto retry;
 	}
 
 	if (crc_is_compressed(pick->crc)) {
@@ -298,16 +294,25 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 			settings->extents_decompress++;
 		}
 
+		if (!failed->nr && !settings->zero_fill) {
+			printf("ERROR: no device to read from.\n");
+			return -1;
+		}
+
+		if (ctx->failed_csum && !settings->ignore_csum) {
+			printf("ERROR: no device to read from with a valid checksum.\n");
+			return -1;
+		}
+
 		if (settings->zero_fill) {
 			verbose(settings, "Zero-filling...\n");
 			zero_fill_bio_iter(orig, orig->bi_iter);
 			return 0;
-		} else if (failed->nr > 0 && settings->use_last) {
+		} else if (settings->use_last) {
 			verbose(settings, "Using last read extent data...\n");
 			return 0;
 		}
 
-		printf("ERROR: no device to read from.\n");
 		return -1;
 	}
 
@@ -455,7 +460,7 @@ static int process_jset(struct recover_settings *settings, struct bch_fs *fs, st
 
 	verbose(settings, "Processing journal entry %llu...\n", le64_to_cpu(jset->seq));
 
-	for (struct jset_entry *entry = jset->start; entry != vstruct_last(jset); entry = vstruct_next(entry)) {
+	vstruct_for_each_safe(jset, entry) {
 		if (entry_is_transaction_start(entry)) {
 			processing_unlink_transaction = is_unlink_transaction(entry);
 			processing_inode_rm_transaction = is_inode_rm_transaction(entry);
@@ -546,7 +551,7 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 					csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, 0), bn);
 					sectors = vstruct_sectors(bn, dev->fs->block_bits);
 				} else {
-					//verbose(settings, "Found btree_node_entry!\n");
+					verbose(settings, "Found btree_node_entry!\n");
 
 					struct btree_node_entry *bne = data + (offset << 9);
 
@@ -558,9 +563,14 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 
 				assert(bset && csum);
 
-				if (!settings->ignore_csum && bch2_crc_cmp(*csum, csum_calc)) {
-					printf("ERROR: failed to verify btree checksum.\n");
-					return -1;
+				if (bch2_crc_cmp(*csum, csum_calc)) {
+					struct printbuf buf = PRINTBUF;
+					bch2_csum_err_msg(&buf, BSET_CSUM_TYPE(bset), *csum, csum_calc);
+					printf("%s\n", buf.buf);
+					printbuf_exit(&buf);
+
+					offset += sectors;
+					continue;
 				}
 
 				if (bset_encrypt(dev->fs, bset, offset << 9)) {
@@ -568,11 +578,7 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 					return -1;
 				}
 
-				for (struct bkey_packed *pkey = bset->start; pkey != vstruct_last(bset); pkey = bkey_p_next(pkey)) {
-					// if (bkey_deleted(pkey)) {
-					// 	continue;
-					// }
-
+				vstruct_for_each_safe(bset, pkey) {
 					struct bkey_buf tmp;
 					bch2_bkey_buf_init(&tmp);
 					bch2_bkey_buf_realloc(&tmp, dev->fs, BKEY_U64s + bkeyp_val_u64s(&bn->format, pkey));
@@ -614,9 +620,16 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 
 				enum bch_csum_type csum_type = JSET_CSUM_TYPE(jset);
 				struct nonce nonce = journal_nonce(jset);
-				if (!settings->ignore_csum && bch2_crc_cmp(jset->csum, csum_vstruct(dev->fs, csum_type, nonce, jset))) {
-					printf("ERROR: failed to verify jset checksum.\n");
-					return -1;
+				struct bch_csum csum_calc = csum_vstruct(dev->fs, csum_type, nonce, jset);
+				u64 sectors = vstruct_sectors(jset, dev->fs->block_bits);
+				if (bch2_crc_cmp(jset->csum, csum_calc)) {
+					struct printbuf buf = PRINTBUF;
+					bch2_csum_err_msg(&buf, csum_type, jset->csum, csum_calc);
+					printf("%s\n", buf.buf);
+					printbuf_exit(&buf);
+
+					offset += sectors;
+					continue;
 				}
 
 				if (bch2_encrypt(dev->fs, csum_type, nonce, jset->encrypted_start, vstruct_end(jset) - (void *) jset->encrypted_start)) {
@@ -629,7 +642,7 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 					return -1;
 				}
 
-				offset += vstruct_sectors(jset, dev->fs->block_bits);
+				offset += sectors;
 				continue;
 			}
 		}
