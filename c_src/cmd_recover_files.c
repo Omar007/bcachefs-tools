@@ -2,14 +2,12 @@
 
 #include "cmds.h"
 
+#include "libbcachefs/btree_io.h"
 #include "libbcachefs/buckets.h"
 #include "libbcachefs/dirent.h"
 #include "libbcachefs/io_read.h"
 #include "libbcachefs/io_write.h"
 #include "libbcachefs/journal_io.h"
-#include "libbcachefs/sb-members.h"
-#include "libbcachefs/super.h"
-#include "libbcachefs/super-io.h"
 
 struct recover_settings {
 	char *target_dir;
@@ -21,6 +19,8 @@ struct recover_settings {
 	bool scan_bset;
 	bool scan_jset;
 	bool use_journal;
+	u64 scan_read_limit;
+	bool dry_run;
 	bool verbose;
 	u64 extents_total;
 	u64 extents_written;
@@ -37,7 +37,7 @@ struct recover_context {
 	u64 offset;
 	void *data;
 	struct bio *bio;
-	struct bkey_i *key;
+	struct bkey_s_c *key;
 	struct bch_io_failures *failed;
 	bool failed_csum;
 	bool failed_decompress;
@@ -59,6 +59,8 @@ static void recover_files_usage(void)
 	     "  -B, --scan-bset       Scan each member disk for extent data. Slow but should recover as much as possible.\n"
 	     "  -J, --scan-jset       Scan each member disk for journal data. Should recover a good amount.\n"
 	     "  -j, --use-journal     Use the live journal for data recovery. Quick but less complete.\n"
+	     "  -m, --scan-read-limit The amount of data (in GiB) to read from disk at once during scanning.\n"
+	     "  -d, --dry-run         Only read, don't actually write out anything anywhere.\n"
 	     "  -v, --verbose         Enable verbose mode for disk operations.\n"
 	     "  -h, --help            Display this help and exit.\n"
 	     "Report bugs to <linux-bcachefs@vger.kernel.org>");
@@ -88,7 +90,9 @@ static bool should_recover(struct recover_settings *settings, struct jset *jset)
 		return settings->start_time <= time && time <= settings->end_time;
 	}
 
-	return false;
+	// If it can not be determined to be within the desired timeframe or not, always recover it.
+	verbose(settings, "Unable to determine if it is within the requested timeframe. Ignoring timeframe restriction...\n");
+	return true;
 }
 
 static inline bool entry_is_transaction_start(struct jset_entry *entry)
@@ -113,21 +117,27 @@ static bool is_inode_rm_transaction(struct jset_entry *entry)
 	return is_transaction(entry, "bch2_inode_rm");
 }
 
-static int recover_unlink_details(struct recover_settings *settings, struct bkey_i *key)
+static int recover_unlink_details(struct recover_settings *settings, struct bkey_s_c *key)
 {
-	if (key->k.type != KEY_TYPE_dirent) {
+	if (key->k->type != KEY_TYPE_dirent) {
 		return 0;
 	}
 
-	struct bkey_s_c s_c = bkey_i_to_s_c(key);
-	struct bkey_s_c_dirent dirent = bkey_s_c_to_dirent(s_c);
+	struct bkey_s_c_dirent dirent = bkey_s_c_to_dirent(*key);
 	if (dirent.v->d_type != DT_REG) {
 		return 0;
 	}
 
-	verbose(settings, "Found deleted filename record. Symlinking name to recovered inode...\n");
-
+	u64 inode = le64_to_cpu(dirent.v->d_inum);
 	struct qstr dname = bch2_dirent_get_name(dirent);
+	verbose(settings, "Found deleted filename record for inode %llu: %s\n", inode, dname.name);
+
+	if (settings->dry_run) {
+		return 0;
+	}
+
+	verbose(settings, "Creating symlink for name to inode recovery file...\n");
+
 	size_t filenameSize = strlen(settings->target_dir) + dname.len + 2;
 	char filename[filenameSize];
 	if (snprintf(filename, filenameSize, "%s/%s", settings->target_dir, dname.name) < 0) {
@@ -136,7 +146,7 @@ static int recover_unlink_details(struct recover_settings *settings, struct bkey
 
 	size_t targetNameSize = 25;
 	char targetName[targetNameSize];
-	if (snprintf(targetName, targetNameSize, "./%llu", le64_to_cpu(dirent.v->d_inum)) < 0) {
+	if (snprintf(targetName, targetNameSize, "./%llu", inode) < 0) {
 		return -1;
 	}
 
@@ -145,7 +155,7 @@ static int recover_unlink_details(struct recover_settings *settings, struct bkey
 			verbose(settings, "%s already exists. Skipping symlink creation.\n", filename);
 			goto done;
 		} else {
-			printf("ERROR: failed to create symlink %s: %d\n", filename, errno);
+			printf("ERROR: failed to create symlink %s: %s (%d)\n", filename, strerror(errno), errno);
 			return -1;
 		}
 	}
@@ -159,7 +169,11 @@ done:
 
 static int write_to_recovery_file(struct recover_settings *settings, struct recover_context *ctx)
 {
-	verbose(settings, "Opening recovery file...\n");
+	if (settings->dry_run) {
+		return 0;
+	}
+
+	verbose(settings, "Writing out extent data to inode recovery file...\n");
 
 	size_t filenameSize = strlen(settings->target_dir) + 25;
 	char filename[filenameSize];
@@ -169,24 +183,20 @@ static int write_to_recovery_file(struct recover_settings *settings, struct reco
 
 	int fd = open(filename, O_RDWR|O_CREAT, 0600);
 	if (fd < 0) {
-		printf("ERROR: failed to open target file %s: %d\n", filename, errno);
+		printf("ERROR: failed to open target file %s: %s (%d)\n", filename, strerror(errno), errno);
 		return -1;
 	}
 
-	verbose(settings, "File %s opened. Seeking to offset %llu...\n", filename, ctx->offset);
-
 	if (lseek(fd, ctx->offset, SEEK_SET) < 0) {
-		printf("ERROR: failed to seek to offset %llu in %s: %d.\n", ctx->offset, filename, errno);
+		printf("ERROR: failed to seek to offset %llu in %s: %s (%d).\n", ctx->offset, filename, strerror(errno), errno);
 		close(fd);
 		return -1;
 	}
 
-	verbose(settings, "Writing out %llu bytes of extent data...\n", ctx->size);
-
 	ssize_t written = write(fd, ctx->data, ctx->size);
 	if (written != ctx->size) {
-		printf("ERROR: failed to write extent data to %s. Wrote: %lu, expected: %llu, errno: %d\n",
-			filename, written, ctx->size, errno);
+		printf("ERROR: failed to write extent data to %s. Wrote: %lu, expected: %llu, err: %s (%d)\n",
+			filename, written, ctx->size, strerror(errno), errno);
 		close(fd);
 		return -1;
 	}
@@ -204,9 +214,7 @@ static int recovery_read_endio(struct recover_settings *settings, struct recover
 {
 	struct bio *orig = ctx->bio;
 	struct bch_io_failures *failed = ctx->failed;
-	struct bkey_i *key = ctx->key;
-
-	struct nonce nonce = extent_nonce(key->k.bversion, pick->crc);
+	struct nonce nonce = extent_nonce(ctx->key->k->bversion, pick->crc);
 
 	if (orig != read_bio) {
 		read_bio->bi_iter.bi_size = pick->crc.compressed_size << 9;
@@ -269,14 +277,11 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 {
 	struct bio *orig = ctx->bio;
 	struct bch_io_failures *failed = ctx->failed;
-	struct bkey_i *key = ctx->key;
 
-	struct bkey_s_c s_c = bkey_i_to_s_c(key);
-
-	if (bkey_extent_is_inline_data(&key->k)) {
-		unsigned bytes = min_t(unsigned, orig->bi_iter.bi_size, bkey_inline_data_bytes(&key->k));
+	if (bkey_extent_is_inline_data(ctx->key->k)) {
+		unsigned bytes = min_t(unsigned, orig->bi_iter.bi_size, bkey_inline_data_bytes(ctx->key->k));
 		swap(orig->bi_iter.bi_size, bytes);
-		memcpy_to_bio(orig, orig->bi_iter, bkey_inline_data_p(s_c));
+		memcpy_to_bio(orig, orig->bi_iter, bkey_inline_data_p(*ctx->key));
 		swap(orig->bi_iter.bi_size, bytes);
 		bio_advance_iter(orig, &orig->bi_iter, bytes);
 		zero_fill_bio_iter(orig, orig->bi_iter);
@@ -284,7 +289,7 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 	}
 
 	struct extent_ptr_decoded pick;
-	if (bch2_bkey_pick_read_device(fs, s_c, failed, &pick, -1) < 0) {
+	if (bch2_bkey_pick_read_device(fs, *ctx->key, failed, &pick, -1) < 0) {
 		settings->extents_failed++;
 		if (ctx->failed_csum) {
 			settings->extents_csum++;
@@ -337,16 +342,23 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 	return 0;
 }
 
-static int recover_inode_data(struct recover_settings *settings, struct bch_fs *fs, struct bkey_i *key)
+static int recover_inode_data(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *key)
 {
-	assert(bkey_extent_is_data(&key->k));
+	assert(bkey_extent_is_data(key->k));
 	settings->extents_total++;
 
+	u64 inode = le64_to_cpu(key->k->p.inode);
 	// Size in extent represent 512 byte sectors.
-	u64 size = le32_to_cpu(key->k.size) * 512;
-	if (bkey_extent_is_inline_data(&key->k)) {
+	u64 size = le32_to_cpu(key->k->size) << 9;
+	if (bkey_extent_is_inline_data(key->k)) {
 		// Size might be less than a sector in case of inline data.
-		size = bkey_inline_data_bytes(&key->k);
+		size = bkey_inline_data_bytes(key->k);
+	}
+
+	if (!size) {
+		// Don't attempt to recover 0 byte extents.
+		verbose(settings, "Skipping empty (0-byte) extent for inode %llu.\n", inode);
+		return 0;
 	}
 
 	void *data = vzalloc(size);
@@ -364,16 +376,19 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 
 	struct bch_io_failures failed = { .nr = 0 };
 	struct recover_context ctx = {
-		.inode = le64_to_cpu(key->k.p.inode),
+		.inode = inode,
 		.size = size,
 		// Offset denotes the /end sector/ so calculate backwards using size.
-		.offset = (le64_to_cpu(key->k.p.offset) - le32_to_cpu(key->k.size)) * 512,
+		.offset = (le64_to_cpu(key->k->p.offset) << 9) - size,
 		.data = data,
 		.bio = bio,
 		.key = key,
 		.failed = &failed,
 		.failed_csum = false,
 	};
+
+	verbose(settings, "Found deleted extent record for inode %llu: %llu bytes @ %llu\n", ctx.inode, ctx.size, ctx.offset);
+
 	if (recovery_read_extent(settings, &ctx, fs) < 0) {
 		printf("ERROR: failed to read extent data.\n");
 		return -1;
@@ -387,18 +402,29 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 	return rc;
 }
 
-static int recover_inode_details(struct recover_settings *settings, struct bch_fs *fs, struct bkey_i *key)
+static int recover_inode_details(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *key)
 {
-	assert(bkey_is_inode(&key->k));
+	assert(bkey_is_inode(key->k));
 
-	u64 inode = le64_to_cpu(key->k.p.offset);
+	u64 inode = le64_to_cpu(key->k->p.offset);
 
-	verbose(settings, "Unpacking information about inode %llu...\n", inode);
+	verbose(settings, "Found metadata for inode %llu.\n", inode);
+
+	if (settings->dry_run) {
+		return 0;
+	}
+
+	verbose(settings, "Unpacking inode details...\n");
 
 	struct bch_inode_unpacked inode_details;
-	if (bch2_inode_unpack(bkey_i_to_s_c(key), &inode_details)) {
+	if (bch2_inode_unpack(*key, &inode_details)) {
 		printf("ERROR: failed to unpack inode information from bkey.\n");
 		return -1;
+	}
+
+	if (!inode_details.bi_size) {
+		// Do not truncate recovered files to 0...
+		return 0;
 	}
 
 	size_t filenameSize = strlen(settings->target_dir) + 25;
@@ -407,10 +433,12 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 		return -1;
 	}
 
-	verbose(settings, "Updating file size for %s...\n", filename);
+	verbose(settings, "Updating file size for %s to %llu bytes...\n", filename, inode_details.bi_size);
 
 	if (truncate(filename, inode_details.bi_size) < 0) {
-		verbose(settings, "Failed to truncate file %s: %d\n", filename, errno);
+		if (errno != ENOENT) {
+			verbose(settings, "Failed to truncate file %s: %s (%d)\n", filename, strerror(errno), errno);
+		}
 		return 0;
 	}
 
@@ -439,23 +467,25 @@ static int process_jset(struct recover_settings *settings, struct bch_fs *fs, st
 		}
 
 		jset_entry_for_each_key(entry, key) {
+			struct bkey_s_c s_c = bkey_i_to_s_c(key);
+
 			if (processing_unlink_transaction) {
-				if (recover_unlink_details(settings, key) < 0) {
+				if (recover_unlink_details(settings, &s_c) < 0) {
 					return -1;
 				}
 			}
 
 			if (processing_inode_rm_transaction) {
-				if (bkey_extent_is_data(&key->k)) {
-					if (recover_inode_data(settings, fs, key) < 0) {
+				if (bkey_extent_is_data(s_c.k)) {
+					if (recover_inode_data(settings, fs, &s_c) < 0) {
 						struct printbuf buf = PRINTBUF;
-						bch2_bkey_val_to_text(&buf, fs, bkey_i_to_s_c(key));
+						bch2_bkey_val_to_text(&buf, fs, s_c);
 						printf("ERROR: problem while processing extent: %s\n", buf.buf);
 						printbuf_exit(&buf);
 						return -1;
 					}
-				} else if (bkey_is_inode(&key->k)) {
-					if (recover_inode_details(settings, fs, key) < 0) {
+				} else if (bkey_is_inode(s_c.k)) {
+					if (recover_inode_details(settings, fs, &s_c) < 0) {
 						return -1;
 					}
 				}
@@ -494,63 +524,169 @@ static struct nonce journal_nonce(const struct jset *jset)
 	}};
 }
 
-static int scan_members(struct recover_settings *settings, struct bch_fs *fs)
+static int process_bucket(struct recover_settings *settings, struct bch_dev *dev, void *data)
 {
-	u64 fs_magic_jset = jset_magic(fs);
+	u64 fs_magic_bset = bset_magic(dev->fs);
+	u64 fs_magic_jset = jset_magic(dev->fs);
 
-	for_each_online_member(fs, dev, 0) {
-		// The bucket_size field records size in 512 sector counts.
-		u64 bsize_in_bytes = dev->mi.bucket_size * 512;
+	for (u64 offset = 0; offset < dev->mi.bucket_size;) {
+		if (settings->scan_bset) {
+			struct btree_node *bn = data;
+			if (le64_to_cpu(bn->magic) == fs_magic_bset) {
+				struct bset *bset = NULL;
+				struct bch_csum *csum = NULL;
+				struct bch_csum csum_calc;
+				u64 sectors = 0;
 
-		verbose(settings, "Processing member %d: buckets=%llu, bsize=%llu\n", dev->dev_idx, dev->mi.nbuckets, bsize_in_bytes);
+				if (!offset) {
+					verbose(settings, "Found btree_node!\n");
 
-		void *data = vzalloc(bsize_in_bytes);
-		if (!data) {
-			printf("ERROR: unable to allocate memory for bucket data.\n");
-			return -1;
-		}
+					bset = &bn->keys;
+					csum = &bn->csum;
+					csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, 0), bn);
+					sectors = vstruct_sectors(bn, dev->fs->block_bits);
+				} else {
+					//verbose(settings, "Found btree_node_entry!\n");
 
-		struct bio *bio = bio_alloc_bioset(NULL, 1, REQ_OP_READ|REQ_SYNC, GFP_NOFS, &fs->bio_read);
-		if (!bio) {
-			printf("ERROR: unable to allocate BIO for read.\n");
-			return -1;
-		}
+					struct btree_node_entry *bne = data + (offset << 9);
 
-		for (u64 bucket = 0; bucket < dev->mi.nbuckets; bucket++) {
-			bio_reset(bio, dev->disk_sb.bdev, REQ_OP_READ|REQ_SYNC);
-			memset(data, 0, bsize_in_bytes);
-			bio_add_page(bio, vmalloc_to_page(data), bsize_in_bytes, 0);
-
-			bio->bi_iter.bi_sector = bucket_to_sector(dev, bucket);
-			submit_bio_wait(bio);
-
-			assert(bio->bi_status == 0);
-
-			void *data_iter = data;
-			for (u16 sector = 0; sector < dev->mi.bucket_size; sector++) {
-				if (settings->scan_jset) {
-					struct jset *jset = data_iter;
-					if (le64_to_cpu(jset->magic) == fs_magic_jset) {
-						verbose(settings, "Found jset: sector=%llu, bucket=%d\n", bucket_to_sector(dev, bucket) + sector, bucket);
-
-						if (!settings->ignore_csum && bch2_crc_cmp(jset->csum, csum_vstruct(fs, JSET_CSUM_TYPE(jset), journal_nonce(jset), jset))) {
-							printf("ERROR: failed to verify jset checksum.\n");
-							return -1;
-						}
-
-						if (should_recover(settings, jset) && process_jset(settings, fs, jset) < 0) {
-							printf("ERROR: Failed to process jset.\n");
-							return -1;
-						}
-
-						data_iter = data_iter + (vstruct_sectors(jset, fs->block_bits) << 9);
-					}
+					bset = &bne->keys;
+					csum = &bne->csum;
+					csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, offset << 9), bne);
+					sectors = vstruct_sectors(bne, dev->fs->block_bits);
 				}
+
+				assert(bset && csum);
+
+				if (!settings->ignore_csum && bch2_crc_cmp(*csum, csum_calc)) {
+					printf("ERROR: failed to verify btree checksum.\n");
+					return -1;
+				}
+
+				if (bset_encrypt(dev->fs, bset, offset << 9)) {
+					printf("Failed to decrypt bset.\n");
+					return -1;
+				}
+
+				for (struct bkey_packed *pkey = bset->start; pkey != vstruct_last(bset); pkey = bkey_p_next(pkey)) {
+					// if (bkey_deleted(pkey)) {
+					// 	continue;
+					// }
+
+					struct bkey_buf tmp;
+					bch2_bkey_buf_init(&tmp);
+					bch2_bkey_buf_realloc(&tmp, dev->fs, BKEY_U64s + bkeyp_val_u64s(&bn->format, pkey));
+
+					tmp.k->k = bkey_packed(pkey) ? __bch2_bkey_unpack_key(&bn->format, pkey) : *packed_to_bkey_c(pkey);
+					memcpy_u64s(&tmp.k->v, bkeyp_val(&bn->format, pkey), bkeyp_val_u64s(&bn->format, pkey));
+
+					struct bkey_s_c s_c = bkey_i_to_s_c(tmp.k);
+					if (bkey_extent_is_data(s_c.k)) {
+						if (recover_inode_data(settings, dev->fs, &s_c) < 0) {
+							struct printbuf buf = PRINTBUF;
+							bch2_bkey_val_to_text(&buf, dev->fs, s_c);
+							printf("ERROR: problem while processing extent: %s\n", buf.buf);
+							printbuf_exit(&buf);
+							return -1;
+						}
+					} else if (bkey_is_inode(&tmp.k->k)) {
+						if (recover_inode_details(settings, dev->fs, &s_c) < 0) {
+							return -1;
+						}
+					}
+
+					bch2_bkey_buf_exit(&tmp, dev->fs);
+				}
+
+				offset += sectors;
+				continue;
 			}
 		}
 
-		bio_put(bio);
-		free(data);
+		if (settings->scan_jset) {
+			struct jset *jset = data + (offset << 9);
+			if (le64_to_cpu(jset->magic) == fs_magic_jset) {
+				verbose(settings, "Found jset!\n");
+
+				if (le64_to_cpu(jset->seq) < dev->fs->journal.oldest_seq_found_ondisk) {
+					printf("Found jset record is no longer present in live journal!\n");
+				}
+
+				enum bch_csum_type csum_type = JSET_CSUM_TYPE(jset);
+				struct nonce nonce = journal_nonce(jset);
+				if (!settings->ignore_csum && bch2_crc_cmp(jset->csum, csum_vstruct(dev->fs, csum_type, nonce, jset))) {
+					printf("ERROR: failed to verify jset checksum.\n");
+					return -1;
+				}
+
+				if (bch2_encrypt(dev->fs, csum_type, nonce, jset->encrypted_start, vstruct_end(jset) - (void *) jset->encrypted_start)) {
+					printf("Failed to decrypt jset.\n");
+					return -1;
+				}
+
+				if (should_recover(settings, jset) && process_jset(settings, dev->fs, jset) < 0) {
+					printf("ERROR: Failed to process jset.\n");
+					return -1;
+				}
+
+				offset += vstruct_sectors(jset, dev->fs->block_bits);
+				continue;
+			}
+		}
+
+		offset++;
+	}
+
+	return 0;
+}
+
+static int scan_members(struct recover_settings *settings, struct bch_fs *fs)
+{
+	for_each_online_member(fs, dev, 0) {
+		// The bucket_size field records size in 512 byte sectors.
+		u64 bsize_in_bytes = dev->mi.bucket_size << 9;
+
+		verbose(settings, "Processing member %d: buckets=%llu, bsectors=%d, bsize=%llu\n", dev->dev_idx, dev->mi.nbuckets, dev->mi.bucket_size, bsize_in_bytes);
+
+		for (u64 bucket = 0, buckets_to_read = min(max(bsize_in_bytes, settings->scan_read_limit) / bsize_in_bytes, dev->mi.nbuckets);
+				bucket < dev->mi.nbuckets;
+				bucket += buckets_to_read, buckets_to_read = min(buckets_to_read, dev->mi.nbuckets - bucket)) {
+			u64 read_size = bsize_in_bytes * buckets_to_read;
+
+			void *data = vzalloc(read_size);
+			if (!data) {
+				printf("ERROR: unable to allocate memory for bucket data.\n");
+				return -1;
+			}
+
+			struct bio *bio = bio_alloc_bioset(NULL, 1, REQ_OP_READ|REQ_SYNC, GFP_NOFS, &fs->bio_read);
+			if (!bio) {
+				printf("ERROR: unable to allocate BIO for read.\n");
+				return -1;
+			}
+			bio_add_page(bio, vmalloc_to_page(data), read_size, 0);
+			bio_set_dev(bio, dev->disk_sb.bdev);
+			bio->bi_iter.bi_sector = bucket_to_sector(dev, bucket);
+			submit_bio_wait(bio);
+
+			if (bio->bi_status) {
+				printf("ERROR: unexpected error while reading disk: %d\n", bio->bi_status);
+				return -1;
+			}
+
+			void *data_iter = data;
+			for (u64 i = 0; i < buckets_to_read; i++) {
+				if (process_bucket(settings, dev, data_iter) < 0) {
+					bio_put(bio);
+					free(data);
+					return -1;
+				}
+				data_iter += bsize_in_bytes;
+			}
+
+			bio_put(bio);
+			free(data);
+		}
 	}
 
 	return 0;
@@ -584,9 +720,11 @@ int cmd_recover_files(int argc, char *argv[])
 		{ "ignore-csum", no_argument, NULL, 'i' },
 		{ "zero-fill", no_argument, NULL, 'z' },
 		{ "use-last", no_argument, NULL, 'l' },
-		{ "scan-bset", no_argument, NULL, 'b' },
-		{ "scan-jset", no_argument, NULL, 'b' },
+		{ "scan-bset", no_argument, NULL, 'B' },
+		{ "scan-jset", no_argument, NULL, 'J' },
 		{ "use-journal", no_argument, NULL, 'j' },
+		{ "scan-read-limit", required_argument, NULL, 'm' },
+		{ "dry-run", no_argument, NULL, 'd' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL }
@@ -602,6 +740,9 @@ int cmd_recover_files(int argc, char *argv[])
 		.scan_bset = false,
 		.scan_jset = false,
 		.use_journal = false,
+		// Default limit of 1 GiB
+		.scan_read_limit = (1 << 30),
+		.dry_run = false,
 		.verbose = false,
 		.extents_total = 0,
 		.extents_written = 0,
@@ -613,18 +754,18 @@ int cmd_recover_files(int argc, char *argv[])
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "t:s:e:izlBJjvh", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "t:s:e:izlBJjm:dvh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 't':
 			settings.target_dir = strdup(optarg);
 			break;
 		case 's':
 			if (kstrtou64(optarg, 10, &settings.start_time))
-				die("error parsing start_time");
+				die("error parsing start-time");
 			break;
 		case 'e':
 			if (kstrtou64(optarg, 10, &settings.end_time))
-				die("error parsing end_time");
+				die("error parsing end-time");
 			break;
 		case 'i':
 			settings.ignore_csum = true;
@@ -644,6 +785,15 @@ int cmd_recover_files(int argc, char *argv[])
 		case 'j':
 			settings.use_journal = true;
 			break;
+		case 'm':
+			u64 gib_limit = 0;
+			if (kstrtou64(optarg, 10, &gib_limit))
+				die("error parsing scan_read_limit");
+			settings.scan_read_limit = gib_limit << 30;
+			break;
+		case 'd':
+			settings.dry_run = true;
+			break;
 		case 'v':
 			settings.verbose = true;
 			break;
@@ -653,12 +803,16 @@ int cmd_recover_files(int argc, char *argv[])
 		}
 	args_shift(optind);
 
-	if (!settings.target_dir) {
+	if (!settings.target_dir && !settings.dry_run) {
 		die("Please supply a target directory");
 	}
 
-	if (!settings.scan_bset && !settings.scan_jset && !settings.use_journal) {
+	unsigned recovery_method_count = settings.scan_bset + settings.scan_jset + settings.use_journal;
+	if (!recovery_method_count) {
 		die("Please select recovery method(s)");
+	} else if (recovery_method_count > 1) {
+		printf("WARN: Multiple recovery methods selected!\n"
+		       "WARN: Be aware that data recovered using one method may be overwritten by another.\n");
 	}
 
 	if (!argc) {
@@ -688,7 +842,7 @@ int cmd_recover_files(int argc, char *argv[])
 		printf("Problem encountered during recovery. Aborted.\n");
 	}
 
-	printf("Recovery finished. Found %llu extents:\n", settings.extents_total);
+	printf("Recovery finished. Found %llu extents using %u recovery method(s):\n", settings.extents_total, recovery_method_count);
 	printf("  - %llu extents recovered and written\n", settings.extents_written);
 	printf("  - %llu extents with read failures\n", settings.extents_failed);
 	if (settings.extents_failed > 0) {
