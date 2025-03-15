@@ -20,6 +20,8 @@ struct recover_settings {
 	bool scan_jset;
 	bool use_journal;
 	u64 scan_read_limit;
+	darray_u64 included_inodes;
+	darray_u64 excluded_inodes;
 	bool dry_run;
 	bool verbose;
 	u64 extents_total;
@@ -53,20 +55,23 @@ static void recover_files_usage(void)
 	     "                        Fail to do so and risk destroying the data you're trying to recover!\n"
 	     "  -s, --start-time      The time (in Unix time) after which deleted data should be recovered (if detectable).\n"
 	     "  -e, --end-time        The time (in Unix time) before which deleted data should be recovered (if detectable).\n"
-	     "  -i, --ignore-csum     Ignore checksum failures and accept the data as-is.\n"
+	     "  -c, --ignore-csum     Ignore checksum failures and accept the data as-is.\n"
 	     "  -z, --zero-fill       Zero fill extent data if it can not (reliably) be read instead of bailing out.\n"
 	     "  -l, --use-last        Write out last read extent data if it can not (reliably) be read instead of bailing out.\n"
 	     "  -B, --scan-bset       Scan each member disk for extent data. Slow but should recover as much as possible.\n"
 	     "  -J, --scan-jset       Scan each member disk for journal data. Should recover a good amount.\n"
 	     "  -j, --use-journal     Use the live journal for data recovery. Quick but less complete.\n"
 	     "  -m, --scan-read-limit The amount of data (in GiB) to read from disk at once during scanning.\n"
+	     "  -i, --include-inode   Only recover data for the given inode. Can be specified multiple times.\n"
+	     "  -I, --exclude-inode   Don't recover data for the given inode. Can be specified multiple times.\n"
 	     "  -d, --dry-run         Only read, don't actually write out anything anywhere.\n"
 	     "  -v, --verbose         Enable verbose mode for disk operations.\n"
 	     "  -h, --help            Display this help and exit.\n"
 	     "Report bugs to <linux-bcachefs@vger.kernel.org>");
 }
 
-static inline int verbose(struct recover_settings *settings, const char *fmt, ...) {
+static inline int verbose(struct recover_settings *settings, const char *fmt, ...)
+{
 	int rc = 0;
 	if (settings->verbose) {
 		va_list args;
@@ -77,7 +82,32 @@ static inline int verbose(struct recover_settings *settings, const char *fmt, ..
 	return rc;
 }
 
-static bool should_recover(struct recover_settings *settings, struct jset *jset)
+static bool should_recover_inode(struct recover_settings *settings, u64 inode)
+{
+	if (!settings->included_inodes.nr && !settings->excluded_inodes.nr) {
+		return true;
+	}
+
+	darray_for_each(settings->included_inodes, included) {
+		if (*included == inode) {
+			return true;
+		}
+	}
+
+	darray_for_each(settings->excluded_inodes, excluded) {
+		if (*excluded == inode) {
+			verbose(settings, "Skipping recovery. Inode %llu is explicitly excluded.\n", inode);
+			return false;
+		}
+	}
+
+	if (settings->included_inodes.nr) {
+		verbose(settings, "Skipping recovery. Inode %llu has not been explicitly requested.\n", inode);
+	}
+	return !settings->included_inodes.nr;
+}
+
+static bool should_recover_jset(struct recover_settings *settings, struct jset *jset)
 {
 	if (settings->start_time == 0 && settings->end_time == 0) {
 		return true;
@@ -129,6 +159,10 @@ static int recover_unlink_details(struct recover_settings *settings, struct bkey
 	}
 
 	u64 inode = le64_to_cpu(dirent.v->d_inum);
+	if (!should_recover_inode(settings, inode)) {
+		return 0;
+	}
+
 	struct qstr dname = bch2_dirent_get_name(dirent);
 	verbose(settings, "Found deleted filename record for inode %llu: %s\n", inode, dname.name);
 
@@ -349,9 +383,7 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 static int recover_inode_data(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *key)
 {
 	assert(bkey_extent_is_data(key->k));
-	settings->extents_total++;
 
-	u64 inode = le64_to_cpu(key->k->p.inode);
 	// Size in extent represent 512 byte sectors.
 	u64 size = le32_to_cpu(key->k->size) << 9;
 	if (bkey_extent_is_inline_data(key->k)) {
@@ -359,9 +391,21 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 		size = bkey_inline_data_bytes(key->k);
 	}
 
+	u64 inode = le64_to_cpu(key->k->p.inode);
+	// Offset denotes the /end sector/ so calculate backwards using size.
+	u64 offset = (le64_to_cpu(key->k->p.offset) << 9) - size;
+
+	verbose(settings, "Found deleted extent record for inode %llu: %llu bytes @ %llu\n", inode, size, offset);
+
+	if (!should_recover_inode(settings, inode)) {
+		return 0;
+	}
+
+	settings->extents_total++;
+
 	if (!size) {
 		// Don't attempt to recover 0 byte extents.
-		verbose(settings, "Skipping empty (0-byte) extent for inode %llu.\n", inode);
+		verbose(settings, "Skipping empty (0-byte) extent.\n");
 		return 0;
 	}
 
@@ -382,16 +426,13 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 	struct recover_context ctx = {
 		.inode = inode,
 		.size = size,
-		// Offset denotes the /end sector/ so calculate backwards using size.
-		.offset = (le64_to_cpu(key->k->p.offset) << 9) - size,
+		.offset = offset,
 		.data = data,
 		.bio = bio,
 		.key = key,
 		.failed = &failed,
 		.failed_csum = false,
 	};
-
-	verbose(settings, "Found deleted extent record for inode %llu: %llu bytes @ %llu\n", ctx.inode, ctx.size, ctx.offset);
 
 	if (recovery_read_extent(settings, &ctx, fs) < 0) {
 		printf("ERROR: failed to read extent data.\n");
@@ -414,7 +455,7 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 
 	verbose(settings, "Found metadata for inode %llu.\n", inode);
 
-	if (settings->dry_run) {
+	if (!should_recover_inode(settings, inode) || settings->dry_run) {
 		return 0;
 	}
 
@@ -506,7 +547,7 @@ static int do_journal_recovery(struct recover_settings *settings, struct bch_fs 
 
 	genradix_for_each(&fs->journal_entries, iter, _p) {
 		p = *_p;
-		if (!p || !should_recover(settings, &p->j)) {
+		if (!p || !should_recover_jset(settings, &p->j)) {
 			continue;
 		}
 
@@ -632,7 +673,7 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 					return -1;
 				}
 
-				if (should_recover(settings, jset) && process_jset(settings, dev->fs, jset) < 0) {
+				if (should_recover_jset(settings, jset) && process_jset(settings, dev->fs, jset) < 0) {
 					printf("ERROR: Failed to process jset.\n");
 					return -1;
 				}
@@ -725,13 +766,15 @@ int cmd_recover_files(int argc, char *argv[])
 		{ "target-dir", required_argument, NULL, 't' },
 		{ "start-time", required_argument, NULL, 's' },
 		{ "end-time", required_argument, NULL, 'e' },
-		{ "ignore-csum", no_argument, NULL, 'i' },
+		{ "ignore-csum", no_argument, NULL, 'c' },
 		{ "zero-fill", no_argument, NULL, 'z' },
 		{ "use-last", no_argument, NULL, 'l' },
 		{ "scan-bset", no_argument, NULL, 'B' },
 		{ "scan-jset", no_argument, NULL, 'J' },
 		{ "use-journal", no_argument, NULL, 'j' },
 		{ "scan-read-limit", required_argument, NULL, 'm' },
+		{ "include-inode", required_argument, NULL, 'i' },
+		{ "exclude-inode", required_argument, NULL, 'I' },
 		{ "dry-run", no_argument, NULL, 'd' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
@@ -750,6 +793,8 @@ int cmd_recover_files(int argc, char *argv[])
 		.use_journal = false,
 		// Default limit of 1 GiB
 		.scan_read_limit = (1 << 30),
+		.included_inodes = {},
+		.excluded_inodes = {},
 		.dry_run = false,
 		.verbose = false,
 		.extents_total = 0,
@@ -762,20 +807,20 @@ int cmd_recover_files(int argc, char *argv[])
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "t:s:e:izlBJjm:dvh", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "t:s:e:czlBJjm:i:I:dvh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 't':
 			settings.target_dir = strdup(optarg);
 			break;
 		case 's':
 			if (kstrtou64(optarg, 10, &settings.start_time))
-				die("error parsing start-time");
+				die("error parsing start-time value");
 			break;
 		case 'e':
 			if (kstrtou64(optarg, 10, &settings.end_time))
-				die("error parsing end-time");
+				die("error parsing end-time value");
 			break;
-		case 'i':
+		case 'c':
 			settings.ignore_csum = true;
 			break;
 		case 'z':
@@ -796,8 +841,20 @@ int cmd_recover_files(int argc, char *argv[])
 		case 'm':
 			u64 gib_limit = 0;
 			if (kstrtou64(optarg, 10, &gib_limit))
-				die("error parsing scan_read_limit");
+				die("error parsing scan-read-limit value");
 			settings.scan_read_limit = gib_limit << 30;
+			break;
+		case 'i':
+			u64 include_inode = 0;
+			if (kstrtou64(optarg, 10, &include_inode))
+				die("error parsing include-inode value");
+			darray_push(&settings.included_inodes, include_inode);
+			break;
+		case 'I':
+			u64 exclude_inode = 0;
+			if (kstrtou64(optarg, 10, &exclude_inode))
+				die("error parsing exclude-inode value");
+			darray_push(&settings.excluded_inodes, exclude_inode);
 			break;
 		case 'd':
 			settings.dry_run = true;
