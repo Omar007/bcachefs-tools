@@ -153,7 +153,7 @@ static int recover_unlink_details(struct recover_settings *settings, struct bkey
 	if (symlink(targetName, filename) < 0) {
 		if (errno == EEXIST) {
 			verbose(settings, "%s already exists. Skipping symlink creation.\n", filename);
-			goto done;
+			return 0;
 		} else {
 			printf("ERROR: failed to create symlink %s: %s (%d)\n", filename, strerror(errno), errno);
 			return -1;
@@ -162,7 +162,6 @@ static int recover_unlink_details(struct recover_settings *settings, struct bkey
 
 	verbose(settings, "Symlink created: %s -> %s\n", filename, targetName);
 
-done:
 	settings->files_names++;
 	return 0;
 }
@@ -579,15 +578,13 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 				}
 
 				vstruct_for_each_safe(bset, pkey) {
-					struct bkey_buf tmp;
-					bch2_bkey_buf_init(&tmp);
-					bch2_bkey_buf_realloc(&tmp, dev->fs, BKEY_U64s + bkeyp_val_u64s(&bn->format, pkey));
+					struct bkey key = bkey_packed(pkey) ? __bch2_bkey_unpack_key(&bn->format, pkey) : *packed_to_bkey_c(pkey);
+					struct bkey_s_c s_c = {
+						.k = &key,
+						.v = bkeyp_val(&bn->format, pkey),
+					};
 
-					tmp.k->k = bkey_packed(pkey) ? __bch2_bkey_unpack_key(&bn->format, pkey) : *packed_to_bkey_c(pkey);
-					memcpy_u64s(&tmp.k->v, bkeyp_val(&bn->format, pkey), bkeyp_val_u64s(&bn->format, pkey));
-
-					struct bkey_s_c s_c = bkey_i_to_s_c(tmp.k);
-					if (bkey_extent_is_data(s_c.k)) {
+					if (bkey_extent_is_data(&key)) {
 						if (recover_inode_data(settings, dev->fs, &s_c) < 0) {
 							struct printbuf buf = PRINTBUF;
 							bch2_bkey_val_to_text(&buf, dev->fs, s_c);
@@ -595,13 +592,11 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 							printbuf_exit(&buf);
 							return -1;
 						}
-					} else if (bkey_is_inode(&tmp.k->k)) {
+					} else if (bkey_is_inode(&key)) {
 						if (recover_inode_details(settings, dev->fs, &s_c) < 0) {
 							return -1;
 						}
 					}
-
-					bch2_bkey_buf_exit(&tmp, dev->fs);
 				}
 
 				offset += sectors;
