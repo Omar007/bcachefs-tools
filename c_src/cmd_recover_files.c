@@ -149,9 +149,7 @@ static bool is_inode_rm_transaction(struct jset_entry *entry)
 
 static int recover_unlink_details(struct recover_settings *settings, struct bkey_s_c *key)
 {
-	if (key->k->type != KEY_TYPE_dirent) {
-		return 0;
-	}
+	assert(key->k->type == KEY_TYPE_dirent);
 
 	struct bkey_s_c_dirent dirent = bkey_s_c_to_dirent(*key);
 	if (dirent.v->d_type != DT_REG) {
@@ -625,7 +623,7 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 						.v = bkeyp_val(&bn->format, pkey),
 					};
 
-					if (bkey_extent_is_data(&key)) {
+					if (bkey_extent_is_data(s_c.k)) {
 						if (recover_inode_data(settings, dev->fs, &s_c) < 0) {
 							struct printbuf buf = PRINTBUF;
 							bch2_bkey_val_to_text(&buf, dev->fs, s_c);
@@ -633,8 +631,12 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 							printbuf_exit(&buf);
 							return -1;
 						}
-					} else if (bkey_is_inode(&key)) {
+					} else if (bkey_is_inode(s_c.k)) {
 						if (recover_inode_details(settings, dev->fs, &s_c) < 0) {
+							return -1;
+						}
+					} else if (s_c.k->type == KEY_TYPE_dirent) {
+						if (recover_unlink_details(settings, &s_c)) {
 							return -1;
 						}
 					}
