@@ -158,8 +158,6 @@ static bool is_inode_rm_transaction(struct jset_entry *entry)
 
 static int recover_unlink_details(struct recover_settings *settings, struct bkey_s_c *key)
 {
-	assert(key->k->type == KEY_TYPE_dirent);
-
 	struct bkey_s_c_dirent dirent = bkey_s_c_to_dirent(*key);
 	if (dirent.v->d_type != DT_REG) {
 		return 0;
@@ -388,8 +386,6 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 
 static int recover_inode_data(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *key)
 {
-	assert(bkey_extent_is_data(key->k));
-
 	// Size in extent represent 512 byte sectors.
 	u64 size = le32_to_cpu(key->k->size) << SECTOR_SHIFT;
 	if (bkey_extent_is_inline_data(key->k)) {
@@ -451,8 +447,6 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 
 static int recover_inode_details(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *key)
 {
-	assert(bkey_is_inode(key->k));
-
 	u64 inode = le64_to_cpu(key->k->p.offset);
 
 	verbose(settings, "Found metadata for inode %llu.\n", inode);
@@ -498,6 +492,39 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 	return 0;
 }
 
+static int process_bkey(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *s_c)
+{
+	switch (s_c->k->type) {
+		case KEY_TYPE_dirent:
+			if (recover_unlink_details(settings, s_c) < 0) {
+				print_bkey_s_c(fs, *s_c, "ERROR: problem while processing dirent");
+				return -1;
+			}
+			break;
+		case KEY_TYPE_inode:
+		case KEY_TYPE_inode_v2:
+		case KEY_TYPE_inode_v3:
+			if (recover_inode_details(settings, fs, s_c) < 0) {
+				print_bkey_s_c(fs, *s_c, "ERROR: problem while processing inode metadata");
+				return -1;
+			}
+			break;
+		case KEY_TYPE_extent:
+		case KEY_TYPE_reflink_v:
+		case KEY_TYPE_inline_data:
+		case KEY_TYPE_indirect_inline_data:
+			if (recover_inode_data(settings, fs, s_c) < 0) {
+				print_bkey_s_c(fs, *s_c, "ERROR: problem while processing extent");
+				return -1;
+			}
+			break;
+		default:
+			verbose(settings, "Ignoring bkey with type %s. Nothing implemented.\n", s_c->k->type < KEY_TYPE_MAX ? bch2_bkey_types[s_c->k->type] : "invalid");
+			break;
+	}
+	return 0;
+}
+
 static int process_jset(struct recover_settings *settings, struct bch_fs *fs, struct jset *jset)
 {
 	bool processing_unlink_transaction = false;
@@ -518,20 +545,8 @@ static int process_jset(struct recover_settings *settings, struct bch_fs *fs, st
 
 		jset_entry_for_each_key(entry, key) {
 			struct bkey_s_c s_c = bkey_i_to_s_c(key);
-
-			if (processing_unlink_transaction && s_c.k->type == KEY_TYPE_dirent && recover_unlink_details(settings, &s_c) < 0) {
-				print_bkey_s_c(fs, s_c, "ERROR: problem while processing dirent");
+			if (process_bkey(settings, fs, &s_c) < 0) {
 				return -1;
-			}
-
-			if (processing_inode_rm_transaction) {
-				if (bkey_extent_is_data(s_c.k) && recover_inode_data(settings, fs, &s_c) < 0) {
-					print_bkey_s_c(fs, s_c, "ERROR: problem while processing extent");
-					return -1;
-				} else if (bkey_is_inode(s_c.k) && recover_inode_details(settings, fs, &s_c) < 0) {
-					print_bkey_s_c(fs, s_c, "ERROR: problem while processing inode metadata");
-					return -1;
-				}
 			}
 		}
 	}
@@ -620,15 +635,7 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 						.k = &key,
 						.v = bkeyp_val(&bn->format, pkey),
 					};
-
-					if (bkey_extent_is_data(s_c.k) && recover_inode_data(settings, dev->fs, &s_c) < 0) {
-						print_bkey_s_c(dev->fs, s_c, "ERROR: problem while processing extent");
-						return -1;
-					} else if (bkey_is_inode(s_c.k) && recover_inode_details(settings, dev->fs, &s_c) < 0) {
-						print_bkey_s_c(dev->fs, s_c, "ERROR: problem while processing inode metadata");
-						return -1;
-					} else if (s_c.k->type == KEY_TYPE_dirent && recover_unlink_details(settings, &s_c) < 0) {
-						print_bkey_s_c(dev->fs, s_c, "ERROR: problem while processing dirent");
+					if (process_bkey(settings, dev->fs, &s_c) < 0) {
 						return -1;
 					}
 				}
