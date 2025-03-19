@@ -82,6 +82,15 @@ static inline int verbose(struct recover_settings *settings, const char *fmt, ..
 	return rc;
 }
 
+static int print_bkey_s_c(struct bch_fs *fs, struct bkey_s_c s_c, const char *msg)
+{
+	struct printbuf buf = PRINTBUF;
+	bch2_bkey_val_to_text(&buf, fs, s_c);
+	int rc = printf("%s: %s\n", msg, buf.buf);
+	printbuf_exit(&buf);
+	return rc;
+}
+
 static bool should_recover_inode(struct recover_settings *settings, u64 inode)
 {
 	if (!settings->included_inodes.nr && !settings->excluded_inodes.nr) {
@@ -243,17 +252,19 @@ static int write_to_recovery_file(struct recover_settings *settings, struct reco
 static int recovery_read_endio(struct recover_settings *settings, struct recover_context *ctx,
 	struct bch_fs *fs, struct bio *read_bio, struct extent_ptr_decoded *pick)
 {
-	struct bio *orig = ctx->bio;
-	struct bch_io_failures *failed = ctx->failed;
-	struct nonce nonce = extent_nonce(ctx->key->k->bversion, pick->crc);
+	if (read_bio->bi_status) {
+		verbose(settings, "I/O error while reading extent ptr: read_bio->bi_status: %d\n", read_bio->bi_status);
+		return -1;
+	}
 
-	if (orig != read_bio) {
+	if (ctx->bio != read_bio) {
 		read_bio->bi_iter.bi_size = pick->crc.compressed_size << SECTOR_SHIFT;
 		read_bio->bi_iter.bi_idx = 0;
 		read_bio->bi_iter.bi_bvec_done = 0;
 	}
 
 	verbose(settings, "Verifying checksum...\n");
+	struct nonce nonce = extent_nonce(ctx->key->k->bversion, pick->crc);
 	struct bch_csum csum = bch2_checksum_bio(fs, pick->crc.csum_type, nonce, read_bio);
 	ctx->failed_csum = bch2_crc_cmp(pick->crc.csum, csum);
 	if (ctx->failed_csum) {
@@ -261,49 +272,37 @@ static int recovery_read_endio(struct recover_settings *settings, struct recover
 		bch2_csum_err_msg(&buf, pick->crc.csum_type, pick->crc.csum, csum);
 		printf("%s\n", buf.buf);
 		printbuf_exit(&buf);
-
-		goto retry;
+		return -1;
 	}
 
 	if (crc_is_compressed(pick->crc)) {
-		assert(orig != read_bio);
+		assert(ctx->bio != read_bio);
 
 		if (bch2_encrypt_bio(fs, pick->crc.csum_type, nonce, read_bio)) {
-			goto retry;
+			return -1;
 		}
 
 		verbose(settings, "Decompressing extent...\n");
-		ctx->failed_decompress = bch2_bio_uncompress(fs, read_bio, orig, orig->bi_iter, pick->crc);
+		ctx->failed_decompress = bch2_bio_uncompress(fs, read_bio, ctx->bio, ctx->bio->bi_iter, pick->crc);
 		if (ctx->failed_decompress) {
 			printf("Failed to decompress extent.\n");
-			goto retry;
+			return -1;
 		}
-		bch2_bio_free_pages_pool(fs, read_bio);
-		bio_put(read_bio);
 	} else {
 		/* don't need to decrypt the entire bio: */
 		nonce = nonce_add(nonce, pick->crc.offset << SECTOR_SHIFT);
 		bio_advance(read_bio, pick->crc.offset << SECTOR_SHIFT);
 
 		if (bch2_encrypt_bio(fs, pick->crc.csum_type, nonce, read_bio)) {
-			goto retry;
+			return -1;
 		}
 	}
 	return 0;
-
-retry:
-	bch2_mark_io_failure(failed, pick, ctx->failed_csum);
-	if (orig != read_bio) {
-		bch2_bio_free_pages_pool(fs, read_bio);
-		bio_put(read_bio);
-	}
-	return failed->nr;
 }
 
 static int recovery_read_extent(struct recover_settings *settings, struct recover_context *ctx, struct bch_fs *fs)
 {
 	struct bio *orig = ctx->bio;
-	struct bch_io_failures *failed = ctx->failed;
 
 	if (bkey_extent_is_inline_data(ctx->key->k)) {
 		unsigned bytes = min_t(unsigned, orig->bi_iter.bi_size, bkey_inline_data_bytes(ctx->key->k));
@@ -316,7 +315,7 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 	}
 
 	struct extent_ptr_decoded pick;
-	if (bch2_bkey_pick_read_device(fs, *ctx->key, failed, &pick, -1) < 0) {
+	if (bch2_bkey_pick_read_device(fs, *ctx->key, ctx->failed, &pick, -1) < 0) {
 		settings->extents_failed++;
 		if (ctx->failed_csum) {
 			settings->extents_csum++;
@@ -325,7 +324,7 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 			settings->extents_decompress++;
 		}
 
-		if (!failed->nr && !settings->zero_fill) {
+		if (!ctx->failed->nr && !settings->zero_fill) {
 			printf("ERROR: no device to read from.\n");
 			return -1;
 		}
@@ -336,11 +335,11 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 		}
 
 		if (settings->zero_fill) {
-			verbose(settings, "Zero-filling...\n");
+			verbose(settings, "Read failed. Zero-filling...\n");
 			zero_fill_bio_iter(orig, orig->bi_iter);
 			return 0;
 		} else if (settings->use_last) {
-			verbose(settings, "Using last read extent data...\n");
+			verbose(settings, "Read failed. Using last read extent data...\n");
 			return 0;
 		}
 
@@ -370,12 +369,21 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 	bio_set_dev(read_bio, dev->disk_sb.bdev);
 	submit_bio_wait(read_bio);
 
-	if (recovery_read_endio(settings, ctx, fs, read_bio, &pick) > 0) {
-		verbose(settings, "Read failed. Retrying...\n");
-		return recovery_read_extent(settings, ctx, fs);
-	}
+	int rc = 0;
+	if (recovery_read_endio(settings, ctx, fs, read_bio, &pick) < 0) {
+		bch2_mark_io_failure(ctx->failed, &pick, ctx->failed_csum);
+		rc = ctx->failed->nr;
 
-	return 0;
+		struct printbuf buf = PRINTBUF;
+		bch2_extent_ptr_to_text(&buf, fs, &pick.ptr);
+		printf("WARN: Read attempt %d failed: %s\nRetrying...\n", ctx->failed->nr, buf.buf);
+		printbuf_exit(&buf);
+	}
+	if (orig != read_bio) {
+		bch2_bio_free_pages_pool(fs, read_bio);
+		bio_put(read_bio);
+	}
+	return rc;
 }
 
 static int recover_inode_data(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *key)
@@ -391,7 +399,7 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 
 	u64 inode = le64_to_cpu(key->k->p.inode);
 	// Offset denotes the /end sector/ so calculate backwards using size.
-	u64 offset = (le64_to_cpu(key->k->p.offset) << SECTOR_SHIFT) - size;
+	u64 offset = (le64_to_cpu(key->k->p.offset) - le32_to_cpu(key->k->size)) << SECTOR_SHIFT;
 
 	verbose(settings, "Found deleted extent record for inode %llu: %llu bytes @ %llu\n", inode, size, offset);
 
@@ -402,46 +410,42 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 	settings->extents_total++;
 
 	if (!size) {
-		// Don't attempt to recover 0 byte extents.
-		verbose(settings, "Skipping empty (0-byte) extent.\n");
-		return 0;
+		// Shortcut for 0-byte extents; no need to read/write anything. Just create target file.
+		return write_to_recovery_file(settings, &(struct recover_context){ .inode = inode });
 	}
 
-	void *data = vzalloc(size);
-	if (!data) {
-		printf("ERROR: unable to allocate memory for extent data.\n");
-		return -1;
-	}
-
-	struct bio *bio = bio_alloc_bioset(NULL, 1, REQ_OP_READ|REQ_SYNC, GFP_NOFS, &fs->bio_read);
-	if (!bio) {
-		printf("ERROR: unable to allocate BIO for read.\n");
-		return -1;
-	}
-	bio_add_page(bio, vmalloc_to_page(data), size, 0);
-
-	struct bch_io_failures failed = { .nr = 0 };
 	struct recover_context ctx = {
 		.inode = inode,
 		.size = size,
 		.offset = offset,
-		.data = data,
-		.bio = bio,
+		.data = vmalloc(size),
+		.bio = bio_alloc_bioset(NULL, 1, REQ_OP_READ|REQ_SYNC, GFP_NOFS, &fs->bio_read),
 		.key = key,
-		.failed = &failed,
+		.failed = &(struct bch_io_failures){ .nr = 0 },
 		.failed_csum = false,
 	};
 
-	if (recovery_read_extent(settings, &ctx, fs) < 0) {
-		printf("ERROR: failed to read extent data.\n");
+	if (!ctx.data || !ctx.bio) {
+		printf("ERROR: unable to allocate memory for read.\n");
 		return -1;
 	}
 
-	assert(bio->bi_status == 0);
+	int rc = 0;
+	do {
+		bio_reset(ctx.bio, NULL, REQ_OP_READ|REQ_SYNC);
+		memset(ctx.data, 0, size);
+		bio_add_page(ctx.bio, vmalloc_to_page(ctx.data), size, 0);
+	} while ((rc = recovery_read_extent(settings, &ctx, fs)) > 0);
 
-	int rc = write_to_recovery_file(settings, &ctx);
-	bio_put(bio);
-	free(data);
+	if (rc < 0) {
+		printf("ERROR: failed to read extent data.\n");
+	} else {
+		assert(ctx.bio->bi_status == 0);
+		rc = write_to_recovery_file(settings, &ctx);
+	}
+
+	bio_put(ctx.bio);
+	free(ctx.data);
 	return rc;
 }
 
@@ -461,8 +465,8 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 
 	struct bch_inode_unpacked inode_details;
 	if (bch2_inode_unpack(*key, &inode_details)) {
-		printf("ERROR: failed to unpack inode information from bkey.\n");
-		return -1;
+		printf("WARN: failed to unpack inode information from bkey for %llu. Skipping...\n", inode);
+		return 0;
 	}
 
 	if (!inode_details.bi_size) {
@@ -479,10 +483,13 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 	verbose(settings, "Updating file size for %s to %llu bytes...\n", filename, inode_details.bi_size);
 
 	if (truncate(filename, inode_details.bi_size) < 0) {
-		if (errno != ENOENT) {
+		if (errno == ENOENT) {
+			verbose(settings, "%s does not exist. Skipping truncation...\n", filename);
+			return 0;
+		} else {
 			verbose(settings, "Failed to truncate file %s: %s (%d)\n", filename, strerror(errno), errno);
+			return -1;
 		}
-		return 0;
 	}
 
 	verbose(settings, "File truncated!\n");
@@ -512,25 +519,18 @@ static int process_jset(struct recover_settings *settings, struct bch_fs *fs, st
 		jset_entry_for_each_key(entry, key) {
 			struct bkey_s_c s_c = bkey_i_to_s_c(key);
 
-			if (processing_unlink_transaction) {
-				if (recover_unlink_details(settings, &s_c) < 0) {
-					return -1;
-				}
+			if (processing_unlink_transaction && s_c.k->type == KEY_TYPE_dirent && recover_unlink_details(settings, &s_c) < 0) {
+				print_bkey_s_c(fs, s_c, "ERROR: problem while processing dirent");
+				return -1;
 			}
 
 			if (processing_inode_rm_transaction) {
-				if (bkey_extent_is_data(s_c.k)) {
-					if (recover_inode_data(settings, fs, &s_c) < 0) {
-						struct printbuf buf = PRINTBUF;
-						bch2_bkey_val_to_text(&buf, fs, s_c);
-						printf("ERROR: problem while processing extent: %s\n", buf.buf);
-						printbuf_exit(&buf);
-						return -1;
-					}
-				} else if (bkey_is_inode(s_c.k)) {
-					if (recover_inode_details(settings, fs, &s_c) < 0) {
-						return -1;
-					}
+				if (bkey_extent_is_data(s_c.k) && recover_inode_data(settings, fs, &s_c) < 0) {
+					print_bkey_s_c(fs, s_c, "ERROR: problem while processing extent");
+					return -1;
+				} else if (bkey_is_inode(s_c.k) && recover_inode_details(settings, fs, &s_c) < 0) {
+					print_bkey_s_c(fs, s_c, "ERROR: problem while processing inode metadata");
+					return -1;
 				}
 			}
 		}
@@ -572,31 +572,31 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 	u64 fs_magic_bset = bset_magic(dev->fs);
 	u64 fs_magic_jset = jset_magic(dev->fs);
 
-	for (u64 offset = 0; offset < dev->mi.bucket_size;) {
+	for (u64 offset = 0, sectors = 0; offset < dev->mi.bucket_size; offset += sectors) {
+		sectors = 1;
+
 		if (settings->scan_bset) {
 			struct btree_node *bn = data;
 			if (le64_to_cpu(bn->magic) == fs_magic_bset) {
 				struct bset *bset = NULL;
 				struct bch_csum *csum = NULL;
 				struct bch_csum csum_calc;
-				u64 sectors = 0;
 
 				if (!offset) {
 					verbose(settings, "Found btree_node!\n");
+					sectors = vstruct_sectors(bn, dev->fs->block_bits);
 
 					bset = &bn->keys;
 					csum = &bn->csum;
 					csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, 0), bn);
-					sectors = vstruct_sectors(bn, dev->fs->block_bits);
 				} else {
 					verbose(settings, "Found btree_node_entry!\n");
-
 					struct btree_node_entry *bne = data + (offset << SECTOR_SHIFT);
+					sectors = vstruct_sectors(bne, dev->fs->block_bits);
 
 					bset = &bne->keys;
 					csum = &bne->csum;
 					csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, offset << SECTOR_SHIFT), bne);
-					sectors = vstruct_sectors(bne, dev->fs->block_bits);
 				}
 
 				assert(bset && csum);
@@ -604,15 +604,13 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 				if (bch2_crc_cmp(*csum, csum_calc)) {
 					struct printbuf buf = PRINTBUF;
 					bch2_csum_err_msg(&buf, BSET_CSUM_TYPE(bset), *csum, csum_calc);
-					printf("%s\n", buf.buf);
+					printf("Skipping bset: %s\n", buf.buf);
 					printbuf_exit(&buf);
-
-					offset += sectors;
 					continue;
 				}
 
 				if (bset_encrypt(dev->fs, bset, offset << SECTOR_SHIFT)) {
-					printf("Failed to decrypt bset.\n");
+					printf("ERROR: Failed to decrypt bset.\n");
 					return -1;
 				}
 
@@ -623,26 +621,18 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 						.v = bkeyp_val(&bn->format, pkey),
 					};
 
-					if (bkey_extent_is_data(s_c.k)) {
-						if (recover_inode_data(settings, dev->fs, &s_c) < 0) {
-							struct printbuf buf = PRINTBUF;
-							bch2_bkey_val_to_text(&buf, dev->fs, s_c);
-							printf("ERROR: problem while processing extent: %s\n", buf.buf);
-							printbuf_exit(&buf);
-							return -1;
-						}
-					} else if (bkey_is_inode(s_c.k)) {
-						if (recover_inode_details(settings, dev->fs, &s_c) < 0) {
-							return -1;
-						}
-					} else if (s_c.k->type == KEY_TYPE_dirent) {
-						if (recover_unlink_details(settings, &s_c)) {
-							return -1;
-						}
+					if (bkey_extent_is_data(s_c.k) && recover_inode_data(settings, dev->fs, &s_c) < 0) {
+						print_bkey_s_c(dev->fs, s_c, "ERROR: problem while processing extent");
+						return -1;
+					} else if (bkey_is_inode(s_c.k) && recover_inode_details(settings, dev->fs, &s_c) < 0) {
+						print_bkey_s_c(dev->fs, s_c, "ERROR: problem while processing inode metadata");
+						return -1;
+					} else if (s_c.k->type == KEY_TYPE_dirent && recover_unlink_details(settings, &s_c) < 0) {
+						print_bkey_s_c(dev->fs, s_c, "ERROR: problem while processing dirent");
+						return -1;
 					}
 				}
 
-				offset += sectors;
 				continue;
 			}
 		}
@@ -651,6 +641,7 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 			struct jset *jset = data + (offset << SECTOR_SHIFT);
 			if (le64_to_cpu(jset->magic) == fs_magic_jset) {
 				verbose(settings, "Found jset!\n");
+				sectors = vstruct_sectors(jset, dev->fs->block_bits);
 
 				if (le64_to_cpu(jset->seq) < dev->fs->journal.oldest_seq_found_ondisk) {
 					printf("Found jset record is no longer present in live journal!\n");
@@ -659,19 +650,16 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 				enum bch_csum_type csum_type = JSET_CSUM_TYPE(jset);
 				struct nonce nonce = journal_nonce(jset);
 				struct bch_csum csum_calc = csum_vstruct(dev->fs, csum_type, nonce, jset);
-				u64 sectors = vstruct_sectors(jset, dev->fs->block_bits);
 				if (bch2_crc_cmp(jset->csum, csum_calc)) {
 					struct printbuf buf = PRINTBUF;
 					bch2_csum_err_msg(&buf, csum_type, jset->csum, csum_calc);
 					printf("%s\n", buf.buf);
 					printbuf_exit(&buf);
-
-					offset += sectors;
 					continue;
 				}
 
 				if (bch2_encrypt(dev->fs, csum_type, nonce, jset->encrypted_start, vstruct_end(jset) - (void *) jset->encrypted_start)) {
-					printf("Failed to decrypt jset.\n");
+					printf("ERROR: Failed to decrypt jset.\n");
 					return -1;
 				}
 
@@ -680,12 +668,9 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 					return -1;
 				}
 
-				offset += sectors;
 				continue;
 			}
 		}
-
-		offset++;
 	}
 
 	return 0;
@@ -721,7 +706,9 @@ static int scan_members(struct recover_settings *settings, struct bch_fs *fs)
 			submit_bio_wait(bio);
 
 			if (bio->bi_status) {
-				printf("ERROR: unexpected error while reading disk: %d\n", bio->bi_status);
+				printf("ERROR: unexpected I/O error while reading member disk: %d\n", bio->bi_status);
+				bio_put(bio);
+				free(data);
 				return -1;
 			}
 
