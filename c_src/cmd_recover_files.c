@@ -248,7 +248,7 @@ static int recovery_read_endio(struct recover_settings *settings, struct recover
 	struct nonce nonce = extent_nonce(ctx->key->k->bversion, pick->crc);
 
 	if (orig != read_bio) {
-		read_bio->bi_iter.bi_size = pick->crc.compressed_size << 9;
+		read_bio->bi_iter.bi_size = pick->crc.compressed_size << SECTOR_SHIFT;
 		read_bio->bi_iter.bi_idx = 0;
 		read_bio->bi_iter.bi_bvec_done = 0;
 	}
@@ -282,8 +282,8 @@ static int recovery_read_endio(struct recover_settings *settings, struct recover
 		bio_put(read_bio);
 	} else {
 		/* don't need to decrypt the entire bio: */
-		nonce = nonce_add(nonce, pick->crc.offset << 9);
-		bio_advance(read_bio, pick->crc.offset << 9);
+		nonce = nonce_add(nonce, pick->crc.offset << SECTOR_SHIFT);
+		bio_advance(read_bio, pick->crc.offset << SECTOR_SHIFT);
 
 		if (bch2_encrypt_bio(fs, pick->crc.csum_type, nonce, read_bio)) {
 			goto retry;
@@ -354,7 +354,7 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 		verbose(settings, "Compressed extent. Bouncing read to decompress...\n");
 		unsigned sectors = pick.crc.compressed_size;
 		read_bio = bio_alloc_bioset(NULL, DIV_ROUND_UP(sectors, PAGE_SECTORS), orig->bi_opf, GFP_NOFS, &fs->bio_read);
-		bch2_bio_alloc_pages_pool(fs, read_bio, sectors << 9);
+		bch2_bio_alloc_pages_pool(fs, read_bio, sectors << SECTOR_SHIFT);
 	} else {
 		read_bio = orig;
 		pick.ptr.offset += pick.crc.offset;
@@ -383,7 +383,7 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 	assert(bkey_extent_is_data(key->k));
 
 	// Size in extent represent 512 byte sectors.
-	u64 size = le32_to_cpu(key->k->size) << 9;
+	u64 size = le32_to_cpu(key->k->size) << SECTOR_SHIFT;
 	if (bkey_extent_is_inline_data(key->k)) {
 		// Size might be less than a sector in case of inline data.
 		size = bkey_inline_data_bytes(key->k);
@@ -391,7 +391,7 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 
 	u64 inode = le64_to_cpu(key->k->p.inode);
 	// Offset denotes the /end sector/ so calculate backwards using size.
-	u64 offset = (le64_to_cpu(key->k->p.offset) << 9) - size;
+	u64 offset = (le64_to_cpu(key->k->p.offset) << SECTOR_SHIFT) - size;
 
 	verbose(settings, "Found deleted extent record for inode %llu: %llu bytes @ %llu\n", inode, size, offset);
 
@@ -591,11 +591,11 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 				} else {
 					verbose(settings, "Found btree_node_entry!\n");
 
-					struct btree_node_entry *bne = data + (offset << 9);
+					struct btree_node_entry *bne = data + (offset << SECTOR_SHIFT);
 
 					bset = &bne->keys;
 					csum = &bne->csum;
-					csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, offset << 9), bne);
+					csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, offset << SECTOR_SHIFT), bne);
 					sectors = vstruct_sectors(bne, dev->fs->block_bits);
 				}
 
@@ -611,7 +611,7 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 					continue;
 				}
 
-				if (bset_encrypt(dev->fs, bset, offset << 9)) {
+				if (bset_encrypt(dev->fs, bset, offset << SECTOR_SHIFT)) {
 					printf("Failed to decrypt bset.\n");
 					return -1;
 				}
@@ -648,7 +648,7 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 		}
 
 		if (settings->scan_jset) {
-			struct jset *jset = data + (offset << 9);
+			struct jset *jset = data + (offset << SECTOR_SHIFT);
 			if (le64_to_cpu(jset->magic) == fs_magic_jset) {
 				verbose(settings, "Found jset!\n");
 
@@ -695,7 +695,7 @@ static int scan_members(struct recover_settings *settings, struct bch_fs *fs)
 {
 	for_each_online_member(fs, dev, 0) {
 		// The bucket_size field records size in 512 byte sectors.
-		u64 bsize_in_bytes = dev->mi.bucket_size << 9;
+		u64 bsize_in_bytes = dev->mi.bucket_size << SECTOR_SHIFT;
 
 		verbose(settings, "Processing member %d: buckets=%llu, bsectors=%d, bsize=%llu\n", dev->dev_idx, dev->mi.nbuckets, dev->mi.bucket_size, bsize_in_bytes);
 
