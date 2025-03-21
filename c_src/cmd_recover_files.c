@@ -387,15 +387,14 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 static int recover_inode_data(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *key)
 {
 	// Size in extent represent 512 byte sectors.
-	u64 size = le32_to_cpu(key->k->size) << SECTOR_SHIFT;
+	u64 size = key->k->size << SECTOR_SHIFT;
 	if (bkey_extent_is_inline_data(key->k)) {
 		// Size might be less than a sector in case of inline data.
 		size = bkey_inline_data_bytes(key->k);
 	}
 
-	u64 inode = le64_to_cpu(key->k->p.inode);
-	// Offset denotes the /end sector/ so calculate backwards using size.
-	u64 offset = (le64_to_cpu(key->k->p.offset) - le32_to_cpu(key->k->size)) << SECTOR_SHIFT;
+	u64 inode = key->k->p.inode;
+	u64 offset = bkey_start_offset(key->k) << SECTOR_SHIFT;
 
 	verbose(settings, "Found deleted extent record for inode %llu: %llu bytes @ %llu\n", inode, size, offset);
 
@@ -447,7 +446,7 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 
 static int recover_inode_details(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *key)
 {
-	u64 inode = le64_to_cpu(key->k->p.offset);
+	u64 inode = key->k->p.offset;
 
 	verbose(settings, "Found metadata for inode %llu.\n", inode);
 
@@ -494,6 +493,38 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 
 static int process_bkey(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *s_c)
 {
+	struct bkey_validate_context from = {
+		.from = BKEY_VALIDATE_btree_node,
+		.flags = BCH_VALIDATE_silent,
+	};
+
+	switch (s_c->k->type) {
+		case KEY_TYPE_dirent:
+			from.btree = BTREE_ID_dirents;
+			break;
+		case KEY_TYPE_inode:
+		case KEY_TYPE_inode_v2:
+		case KEY_TYPE_inode_v3:
+			from.btree = BTREE_ID_inodes;
+			break;
+		case KEY_TYPE_extent:
+		case KEY_TYPE_inline_data:
+			from.btree = BTREE_ID_extents;
+			break;
+		case KEY_TYPE_reflink_v:
+		case KEY_TYPE_indirect_inline_data:
+			from.btree = BTREE_ID_reflink;
+			break;
+		default:
+			verbose(settings, "Ignoring bkey with type %s. Nothing implemented.\n", s_c->k->type < KEY_TYPE_MAX ? bch2_bkey_types[s_c->k->type] : "invalid");
+			return 0;
+	}
+
+	if (bch2_bkey_validate(fs, *s_c, from)) {
+		verbose(settings, "Validation for found bkey failed. Skipping...\n");
+		return 0;
+	}
+
 	switch (s_c->k->type) {
 		case KEY_TYPE_dirent:
 			if (recover_unlink_details(settings, s_c) < 0) {
@@ -510,8 +541,8 @@ static int process_bkey(struct recover_settings *settings, struct bch_fs *fs, st
 			}
 			break;
 		case KEY_TYPE_extent:
-		case KEY_TYPE_reflink_v:
 		case KEY_TYPE_inline_data:
+		case KEY_TYPE_reflink_v:
 		case KEY_TYPE_indirect_inline_data:
 			if (recover_inode_data(settings, fs, s_c) < 0) {
 				print_bkey_s_c(fs, *s_c, "ERROR: problem while processing extent");
@@ -519,7 +550,6 @@ static int process_bkey(struct recover_settings *settings, struct bch_fs *fs, st
 			}
 			break;
 		default:
-			verbose(settings, "Ignoring bkey with type %s. Nothing implemented.\n", s_c->k->type < KEY_TYPE_MAX ? bch2_bkey_types[s_c->k->type] : "invalid");
 			break;
 	}
 	return 0;
@@ -627,6 +657,16 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 				if (bset_encrypt(dev->fs, bset, offset << SECTOR_SHIFT)) {
 					printf("ERROR: Failed to decrypt bset.\n");
 					return -1;
+				}
+
+				if (!offset) {
+					struct printbuf buf = PRINTBUF;
+					if (bch2_bkey_format_invalid(dev->fs, &bn->format, 0, &buf)) {
+						printf("Invalid format in btree_node: %s. Skipping...\n", buf.buf);
+						printbuf_exit(&buf);
+						return 0;
+					}
+					printbuf_exit(&buf);
 				}
 
 				vstruct_for_each_safe(bset, pkey) {
