@@ -476,12 +476,16 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 	verbose(settings, "Updating file size for %s to %llu bytes...\n", filename, inode_details.bi_size);
 
 	if (truncate(filename, inode_details.bi_size) < 0) {
-		if (errno == ENOENT) {
-			verbose(settings, "%s does not exist. Skipping truncation...\n", filename);
-			return 0;
-		} else {
-			verbose(settings, "Failed to truncate file %s: %s (%d)\n", filename, strerror(errno), errno);
-			return -1;
+		switch (errno) {
+			case ENOENT:
+				verbose(settings, "%s does not exist. Skipping truncation...\n", filename);
+				return 0;
+			case EINVAL:
+				verbose(settings, "%s not a file or smaller than target. Skipping truncation...\n", filename);
+				return 0;
+			default:
+				verbose(settings, "Failed to truncate file %s: %s (%d)\n", filename, strerror(errno), errno);
+				return -1;
 		}
 	}
 
