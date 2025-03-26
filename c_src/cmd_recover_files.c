@@ -22,6 +22,7 @@ struct recover_settings {
 	u64 scan_read_limit;
 	darray_u64 included_inodes;
 	darray_u64 excluded_inodes;
+	bool exclude_live_inodes;
 	bool dry_run;
 	bool verbose;
 	u64 extents_total;
@@ -47,26 +48,27 @@ struct recover_context {
 
 static void recover_files_usage(void)
 {
-	puts("bcachefs recover-files - Attempt to recover deleted files using journal information\n"
+	puts("bcachefs recover-files - Attempt to recover files using on-disk filesystem information\n"
 	     "Usage: bcachefs recover-files [OPTION]... <devices>\n"
 	     "\n"
 	     "Options:\n"
-	     "  -t, --target-dir      Target directory to place the recovered files in. USE A LOCATION ON A DIFFERENT FILESYSTEM!\n"
-	     "                        Fail to do so and risk destroying the data you're trying to recover!\n"
-	     "  -s, --start-time      The time (in Unix time) after which deleted data should be recovered (if detectable).\n"
-	     "  -e, --end-time        The time (in Unix time) before which deleted data should be recovered (if detectable).\n"
-	     "  -c, --ignore-csum     Ignore checksum failures and accept the data as-is.\n"
-	     "  -z, --zero-fill       Zero fill extent data if it can not (reliably) be read instead of bailing out.\n"
-	     "  -l, --use-last        Write out last read extent data if it can not (reliably) be read instead of bailing out.\n"
-	     "  -B, --scan-bset       Scan each member disk for extent data. Slow but should recover as much as possible.\n"
-	     "  -J, --scan-jset       Scan each member disk for journal data. Should recover a good amount.\n"
-	     "  -j, --use-journal     Use the live journal for data recovery. Quick but less complete.\n"
-	     "  -m, --scan-read-limit The amount of data (in GiB) to read from disk at once during scanning.\n"
-	     "  -i, --include-inode   Only recover data for the given inode. Can be specified multiple times.\n"
-	     "  -I, --exclude-inode   Don't recover data for the given inode. Can be specified multiple times.\n"
-	     "  -d, --dry-run         Only read, don't actually write out anything anywhere.\n"
-	     "  -v, --verbose         Enable verbose mode for disk operations.\n"
-	     "  -h, --help            Display this help and exit.\n"
+	     "  -t, --target-dir           Target directory to place the recovered files in. USE A LOCATION ON A DIFFERENT FILESYSTEM!\n"
+	     "                             Fail to do so and risk destroying the data you're trying to recover!\n"
+	     "  -s, --start-time           The time (in Unix time) after which data should be recovered (if detectable).\n"
+	     "  -e, --end-time             The time (in Unix time) before which data should be recovered (if detectable).\n"
+	     "  -c, --ignore-csum          Ignore checksum failures and accept the data as-is.\n"
+	     "  -z, --zero-fill            Zero fill extent data if it can not (reliably) be read instead of bailing out.\n"
+	     "  -l, --use-last             Write out last read extent data if it can not (reliably) be read instead of bailing out.\n"
+	     "  -B, --scan-bset            Scan each member disk for extent data. Slow but should recover as much as possible.\n"
+	     "  -J, --scan-jset            Scan each member disk for journal data. Should recover a good amount.\n"
+	     "  -j, --use-journal          Use the live journal for data recovery. Quick but less complete.\n"
+	     "  -m, --scan-read-limit      The amount of data (in GiB) to read from disk at once during scanning.\n"
+	     "  -i, --include-inode        Only recover data for the given inode. Can be specified multiple times.\n"
+	     "  -I, --exclude-inode        Don't recover data for the given inode. Can be specified multiple times.\n"
+	     "  -X, --exclude-live-inodes  Don't recover data for inodes that exist in the live filesystem.\n"
+	     "  -d, --dry-run              Only read, don't actually write out anything anywhere.\n"
+	     "  -v, --verbose              Enable verbose mode for disk operations.\n"
+	     "  -h, --help                 Display this help and exit.\n"
 	     "Report bugs to <linux-bcachefs@vger.kernel.org>");
 }
 
@@ -91,8 +93,16 @@ static int print_bkey_s_c(struct bch_fs *fs, struct bkey_s_c s_c, const char *ms
 	return rc;
 }
 
-static bool should_recover_inode(struct recover_settings *settings, u64 inode)
+static bool should_recover_inode(struct recover_settings *settings, struct bch_fs *fs, u64 inode)
 {
+	if (settings->exclude_live_inodes) {
+		struct bch_inode_unpacked inode_details;
+		if (!bch2_trans_do(fs, bch2_inode_find_by_inum_nowarn_trans(trans, (subvol_inum){ 1, inode }, &inode_details))) {
+			verbose(settings, "Skipping recovery. Inode %llu still exists.\n", inode);
+			return false;
+		}
+	}
+
 	if (!settings->included_inodes.nr && !settings->excluded_inodes.nr) {
 		return true;
 	}
@@ -156,7 +166,7 @@ static bool is_inode_rm_transaction(struct jset_entry *entry)
 	return is_transaction(entry, "bch2_inode_rm");
 }
 
-static int recover_unlink_details(struct recover_settings *settings, struct bkey_s_c *key)
+static int recover_unlink_details(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *key)
 {
 	struct bkey_s_c_dirent dirent = bkey_s_c_to_dirent(*key);
 	if (dirent.v->d_type != DT_REG) {
@@ -164,14 +174,10 @@ static int recover_unlink_details(struct recover_settings *settings, struct bkey
 	}
 
 	u64 inode = le64_to_cpu(dirent.v->d_inum);
-	if (!should_recover_inode(settings, inode)) {
-		return 0;
-	}
-
 	struct qstr dname = bch2_dirent_get_name(dirent);
-	verbose(settings, "Found deleted filename record for inode %llu: %s\n", inode, dname.name);
+	verbose(settings, "Found filename record for inode %llu: %s\n", inode, dname.name);
 
-	if (settings->dry_run) {
+	if (!should_recover_inode(settings, fs, inode) || settings->dry_run) {
 		return 0;
 	}
 
@@ -396,9 +402,9 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 	u64 inode = key->k->p.inode;
 	u64 offset = bkey_start_offset(key->k) << SECTOR_SHIFT;
 
-	verbose(settings, "Found deleted extent record for inode %llu: %llu bytes @ %llu\n", inode, size, offset);
+	verbose(settings, "Found extent record for inode %llu: %llu bytes @ %llu\n", inode, size, offset);
 
-	if (!should_recover_inode(settings, inode)) {
+	if (!should_recover_inode(settings, fs, inode)) {
 		return 0;
 	}
 
@@ -450,7 +456,7 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 
 	verbose(settings, "Found metadata for inode %llu.\n", inode);
 
-	if (!should_recover_inode(settings, inode) || settings->dry_run) {
+	if (!should_recover_inode(settings, fs, inode) || settings->dry_run) {
 		return 0;
 	}
 
@@ -531,7 +537,7 @@ static int process_bkey(struct recover_settings *settings, struct bch_fs *fs, st
 
 	switch (s_c->k->type) {
 		case KEY_TYPE_dirent:
-			if (recover_unlink_details(settings, s_c) < 0) {
+			if (recover_unlink_details(settings, fs, s_c) < 0) {
 				print_bkey_s_c(fs, *s_c, "ERROR: problem while processing dirent");
 				return -1;
 			}
@@ -815,6 +821,7 @@ int cmd_recover_files(int argc, char *argv[])
 		{ "scan-read-limit", required_argument, NULL, 'm' },
 		{ "include-inode", required_argument, NULL, 'i' },
 		{ "exclude-inode", required_argument, NULL, 'I' },
+		{ "exclude-live-inodes", no_argument, NULL, 'X' },
 		{ "dry-run", no_argument, NULL, 'd' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
@@ -835,6 +842,7 @@ int cmd_recover_files(int argc, char *argv[])
 		.scan_read_limit = (1 << 30),
 		.included_inodes = {},
 		.excluded_inodes = {},
+		.exclude_live_inodes = false,
 		.dry_run = false,
 		.verbose = false,
 		.extents_total = 0,
@@ -847,7 +855,7 @@ int cmd_recover_files(int argc, char *argv[])
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "t:s:e:czlBJjm:i:I:dvh", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "t:s:e:czlBJjm:i:I:Xdvh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 't':
 			settings.target_dir = strdup(optarg);
@@ -896,6 +904,9 @@ int cmd_recover_files(int argc, char *argv[])
 				die("error parsing exclude-inode value");
 			darray_push(&settings.excluded_inodes, exclude_inode);
 			break;
+		case 'X':
+			settings.exclude_live_inodes = true;
+			break;
 		case 'd':
 			settings.dry_run = true;
 			break;
@@ -915,6 +926,8 @@ int cmd_recover_files(int argc, char *argv[])
 	unsigned recovery_method_count = settings.scan_bset + settings.scan_jset + settings.use_journal;
 	if (!recovery_method_count) {
 		die("Please select recovery method(s)");
+	} else if (settings.use_journal && settings.exclude_live_inodes) {
+		die("-X flag not supported when recovering from live journal");
 	} else if (recovery_method_count > 1) {
 		printf("WARN: Multiple recovery methods selected!\n"
 		       "WARN: Be aware that data recovered using one method may be overwritten by another.\n");
@@ -930,9 +943,9 @@ int cmd_recover_files(int argc, char *argv[])
 	opt_set(opts, norecovery, true);
 	opt_set(opts, read_only, true);
 	opt_set(opts, degraded, BCH_DEGRADED_yes);
-	opt_set(opts, retain_recovery_info, true);
 	opt_set(opts, read_journal_only, true);
 	opt_set(opts, read_entire_journal, settings.use_journal);
+	opt_set(opts, retain_recovery_info, settings.use_journal);
 	opt_set(opts, verbose, settings.verbose);
 
 	darray_str devs = get_or_split_cmdline_devs(argc, argv);
