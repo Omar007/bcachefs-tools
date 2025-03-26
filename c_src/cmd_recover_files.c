@@ -259,7 +259,7 @@ static int recovery_read_endio(struct recover_settings *settings, struct recover
 	struct bch_fs *fs, struct bio *read_bio, struct extent_ptr_decoded *pick)
 {
 	if (read_bio->bi_status) {
-		verbose(settings, "I/O error while reading extent ptr: read_bio->bi_status: %d\n", read_bio->bi_status);
+		verbose(settings, "I/O error while reading extent ptr: %s (%d)\n", blk_status_to_str(read_bio->bi_status), read_bio->bi_status);
 		return -1;
 	}
 
@@ -440,8 +440,8 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 
 	int rc = 0;
 	do {
-		bio_reset(ctx.bio, NULL, REQ_OP_READ|REQ_SYNC);
 		memset(ctx.data, 0, size);
+		bio_reset(ctx.bio, NULL, REQ_OP_READ|REQ_SYNC);
 		bio_add_page(ctx.bio, vmalloc_to_page(ctx.data), size, 0);
 	} while ((rc = recovery_read_extent(settings, &ctx, fs)) > 0);
 
@@ -458,8 +458,8 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 			break;
 	}
 
-	bio_put(ctx.bio);
 	free(ctx.data);
+	bio_put(ctx.bio);
 	return rc;
 }
 
@@ -748,55 +748,64 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 
 static int scan_members(struct recover_settings *settings, struct bch_fs *fs)
 {
+	struct bio *bio = bio_alloc_bioset(NULL, 1, REQ_OP_READ|REQ_SYNC, GFP_NOFS, &fs->bio_read);
+	if (!bio) {
+		printf("ERROR: unable to allocate BIO for read.\n");
+		return -1;
+	}
+
 	for_each_online_member(fs, dev, 0) {
-		// The bucket_size field records size in 512 byte sectors.
-		u64 bsize_in_bytes = dev->mi.bucket_size << SECTOR_SHIFT;
+		u64 bsize_in_bytes = bucket_bytes(dev);
+		u64 chunk_size_in_buckets = min(max(bsize_in_bytes, settings->scan_read_limit) / bsize_in_bytes, dev->mi.nbuckets);
+		u64 chunk_size_in_bytes = bsize_in_bytes * chunk_size_in_buckets;
 
-		verbose(settings, "Processing member %d: buckets=%llu, bsectors=%d, bsize=%llu\n", dev->dev_idx, dev->mi.nbuckets, dev->mi.bucket_size, bsize_in_bytes);
+		verbose(settings, "Processing member %d: buckets=%llu, bsectors=%d, bsize=%llu, bsperread=%llu\n",
+			dev->dev_idx, dev->mi.nbuckets, dev->mi.bucket_size, bsize_in_bytes, chunk_size_in_buckets);
 
-		for (u64 bucket = 0, buckets_to_read = min(max(bsize_in_bytes, settings->scan_read_limit) / bsize_in_bytes, dev->mi.nbuckets);
-				bucket < dev->mi.nbuckets;
-				bucket += buckets_to_read, buckets_to_read = min(buckets_to_read, dev->mi.nbuckets - bucket)) {
+		void *data = vmalloc(chunk_size_in_bytes);
+		if (!data) {
+			printf("ERROR: unable to allocate memory for bucket data.\n");
+			free(bio);
+			return -1;
+		}
+
+		for (u64 bucket = 0; bucket < dev->mi.nbuckets;) {
+			u64 buckets_to_read = min(chunk_size_in_buckets, dev->mi.nbuckets - bucket);
 			u64 read_size = bsize_in_bytes * buckets_to_read;
 
-			void *data = vzalloc(read_size);
-			if (!data) {
-				printf("ERROR: unable to allocate memory for bucket data.\n");
-				return -1;
-			}
+			verbose(settings, "Reading bucket %llu through %llu (%llu bytes)...\n", bucket, bucket + buckets_to_read, read_size);
 
-			struct bio *bio = bio_alloc_bioset(NULL, 1, REQ_OP_READ|REQ_SYNC, GFP_NOFS, &fs->bio_read);
-			if (!bio) {
-				printf("ERROR: unable to allocate BIO for read.\n");
-				return -1;
-			}
+			memset(data, 0, chunk_size_in_bytes);
+			bio_reset(bio, NULL, REQ_OP_READ|REQ_SYNC);
 			bio_add_page(bio, vmalloc_to_page(data), read_size, 0);
 			bio_set_dev(bio, dev->disk_sb.bdev);
 			bio->bi_iter.bi_sector = bucket_to_sector(dev, bucket);
 			submit_bio_wait(bio);
 
 			if (bio->bi_status) {
-				printf("ERROR: unexpected I/O error while reading member disk: %d\n", bio->bi_status);
-				bio_put(bio);
+				printf("ERROR: unexpected I/O error while reading member disk %d: %s (%d)\n", dev->dev_idx, blk_status_to_str(bio->bi_status), bio->bi_status);
 				free(data);
+				bio_put(bio);
 				return -1;
 			}
 
 			void *data_iter = data;
 			for (u64 i = 0; i < buckets_to_read; i++) {
 				if (process_bucket(settings, dev, data_iter) < 0) {
-					bio_put(bio);
 					free(data);
+					bio_put(bio);
 					return -1;
 				}
 				data_iter += bsize_in_bytes;
 			}
 
-			bio_put(bio);
-			free(data);
+			bucket += buckets_to_read;
 		}
+
+		free(data);
 	}
 
+	bio_put(bio);
 	return 0;
 }
 
@@ -975,7 +984,7 @@ int cmd_recover_files(int argc, char *argv[])
 	printf("Starting recovery...\n");
 	int rc = do_recover_files(&settings, c);
 	if (rc < 0) {
-		printf("Problem encountered during recovery. Aborted.\n");
+		printf("ERROR: Problem encountered during recovery. Aborted.\n");
 	}
 
 	printf("Recovery finished. Found %llu extents using %u recovery method(s):\n", settings.extents_total, recovery_method_count);
