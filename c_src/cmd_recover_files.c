@@ -14,8 +14,9 @@ struct recover_settings {
 	u64 start_time;
 	u64 end_time;
 	bool ignore_csum;
-	bool zero_fill;
-	bool use_last;
+	bool zero_extent;
+	bool skip_extent;
+	bool use_last_extent;
 	bool scan_bset;
 	bool scan_jset;
 	bool use_journal;
@@ -57,8 +58,9 @@ static void recover_files_usage(void)
 	     "  -s, --start-time           The time (in Unix time) after which data should be recovered (if detectable).\n"
 	     "  -e, --end-time             The time (in Unix time) before which data should be recovered (if detectable).\n"
 	     "  -c, --ignore-csum          Ignore checksum failures and accept the data as-is.\n"
-	     "  -z, --zero-fill            Zero fill extent data if it can not (reliably) be read instead of bailing out.\n"
-	     "  -l, --use-last             Write out last read extent data if it can not (reliably) be read instead of bailing out.\n"
+	     "  -z, --zero-extent          Zero fill extent data if it can not (reliably) be read.\n"
+	     "  -Z, --skip-extent          Skip and don't write any extent data if it can not (reliably) be read.\n"
+	     "  -l, --last-read-extent     Write out last read extent data if it can not (reliably) be read.\n"
 	     "  -B, --scan-bset            Scan each member disk for extent data. Slow but should recover as much as possible.\n"
 	     "  -J, --scan-jset            Scan each member disk for journal data. Should recover a good amount.\n"
 	     "  -j, --use-journal          Use the live journal for data recovery. Quick but less complete.\n"
@@ -321,32 +323,37 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 	struct extent_ptr_decoded pick;
 	if (bch2_bkey_pick_read_device(fs, *ctx->key, ctx->failed, &pick, -1) < 0) {
 		settings->extents_failed++;
+
 		if (ctx->failed_csum) {
 			settings->extents_csum++;
+
+			if (!settings->ignore_csum) {
+				printf("ERROR: no device to read from with a valid checksum.\n");
+				return -1;
+			}
 		}
+
 		if (ctx->failed_decompress) {
 			settings->extents_decompress++;
 		}
 
-		if (!ctx->failed->nr && !settings->zero_fill) {
-			printf("ERROR: no device to read from.\n");
-			return -1;
-		}
-
-		if (ctx->failed_csum && !settings->ignore_csum) {
-			printf("ERROR: no device to read from with a valid checksum.\n");
-			return -1;
-		}
-
-		if (settings->zero_fill) {
+		if (settings->zero_extent) {
 			verbose(settings, "Read failed. Zero-filling...\n");
 			zero_fill_bio_iter(orig, orig->bi_iter);
 			return 0;
-		} else if (settings->use_last) {
+		}
+
+		if (settings->skip_extent) {
+			verbose(settings, "Read failed. Skipping...\n");
+			return -2;
+		}
+
+		if (settings->use_last_extent && ctx->failed->nr) {
 			verbose(settings, "Read failed. Using last read extent data...\n");
 			return 0;
 		}
 
+		printf("ERROR: no device to read from.\n");
 		return -1;
 	}
 
@@ -438,11 +445,17 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 		bio_add_page(ctx.bio, vmalloc_to_page(ctx.data), size, 0);
 	} while ((rc = recovery_read_extent(settings, &ctx, fs)) > 0);
 
-	if (rc < 0) {
-		printf("ERROR: failed to read extent data.\n");
-	} else {
-		assert(ctx.bio->bi_status == 0);
-		rc = write_to_recovery_file(settings, &ctx);
+	switch (rc) {
+		case 0:
+			assert(ctx.bio->bi_status == 0);
+			rc = write_to_recovery_file(settings, &ctx);
+			break;
+		case -2:
+			rc = 0;
+			break;
+		default:
+			printf("ERROR: failed to read extent data.\n");
+			break;
 	}
 
 	bio_put(ctx.bio);
@@ -813,8 +826,9 @@ int cmd_recover_files(int argc, char *argv[])
 		{ "start-time", required_argument, NULL, 's' },
 		{ "end-time", required_argument, NULL, 'e' },
 		{ "ignore-csum", no_argument, NULL, 'c' },
-		{ "zero-fill", no_argument, NULL, 'z' },
-		{ "use-last", no_argument, NULL, 'l' },
+		{ "zero-extent", no_argument, NULL, 'z' },
+		{ "skip-extent", no_argument, NULL, 'Z' },
+		{ "last-read-extent", no_argument, NULL, 'l' },
 		{ "scan-bset", no_argument, NULL, 'B' },
 		{ "scan-jset", no_argument, NULL, 'J' },
 		{ "use-journal", no_argument, NULL, 'j' },
@@ -833,8 +847,9 @@ int cmd_recover_files(int argc, char *argv[])
 		.start_time = 0,
 		.end_time = 0,
 		.ignore_csum = false,
-		.zero_fill = false,
-		.use_last = false,
+		.zero_extent = false,
+		.skip_extent = false,
+		.use_last_extent = false,
 		.scan_bset = false,
 		.scan_jset = false,
 		.use_journal = false,
@@ -855,7 +870,7 @@ int cmd_recover_files(int argc, char *argv[])
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "t:s:e:czlBJjm:i:I:Xdvh", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "t:s:e:czZlBJjm:i:I:Xdvh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 't':
 			settings.target_dir = strdup(optarg);
@@ -872,10 +887,13 @@ int cmd_recover_files(int argc, char *argv[])
 			settings.ignore_csum = true;
 			break;
 		case 'z':
-			settings.zero_fill = true;
+			settings.zero_extent = true;
+			break;
+		case 'Z':
+			settings.skip_extent = true;
 			break;
 		case 'l':
-			settings.use_last = true;
+			settings.use_last_extent = true;
 			break;
 		case 'B':
 			settings.scan_bset = true;
