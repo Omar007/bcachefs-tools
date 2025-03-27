@@ -451,7 +451,8 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 			rc = write_to_recovery_file(settings, &ctx);
 			break;
 		case -2:
-			rc = 0;
+			// Shortcut for skipped extents; no need to read/write anything. Just create target file.
+			rc = write_to_recovery_file(settings, &(struct recover_context){ .inode = inode });
 			break;
 		default:
 			printf("ERROR: failed to read extent data.\n");
