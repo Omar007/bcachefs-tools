@@ -9,6 +9,21 @@
 #include "libbcachefs/io_write.h"
 #include "libbcachefs/journal_io.h"
 
+#define verbose(_settings, ...) do { \
+	if (_settings->verbose) { \
+		printf(__VA_ARGS__); \
+	} \
+} while (0)
+
+#define print_bch(_print) do { \
+	struct printbuf buf = PRINTBUF; \
+	_print; \
+	if (buf.size) { \
+		printf("%s\n", buf.buf); \
+	} \
+	printbuf_exit(&buf); \
+} while (0)
+
 struct recover_settings {
 	char *target_dir;
 	u64 start_time;
@@ -72,27 +87,6 @@ static void recover_files_usage(void)
 	     "  -v, --verbose              Enable verbose mode for disk operations.\n"
 	     "  -h, --help                 Display this help and exit.\n"
 	     "Report bugs to <linux-bcachefs@vger.kernel.org>");
-}
-
-static inline int verbose(struct recover_settings *settings, const char *fmt, ...)
-{
-	int rc = 0;
-	if (settings->verbose) {
-		va_list args;
-		va_start(args, fmt);
-		rc = vprintf(fmt, args);
-		va_end(args);
-	}
-	return rc;
-}
-
-static int print_bkey_s_c(struct bch_fs *fs, struct bkey_s_c s_c, const char *msg)
-{
-	struct printbuf buf = PRINTBUF;
-	bch2_bkey_val_to_text(&buf, fs, s_c);
-	int rc = printf("%s: %s\n", msg, buf.buf);
-	printbuf_exit(&buf);
-	return rc;
 }
 
 static bool should_recover_inode(struct recover_settings *settings, struct bch_fs *fs, u64 inode)
@@ -274,10 +268,7 @@ static int recovery_read_endio(struct recover_settings *settings, struct recover
 	struct bch_csum csum = bch2_checksum_bio(fs, pick->crc.csum_type, nonce, read_bio);
 	ctx->failed_csum = bch2_crc_cmp(pick->crc.csum, csum);
 	if (ctx->failed_csum) {
-		struct printbuf buf = PRINTBUF;
-		bch2_csum_err_msg(&buf, pick->crc.csum_type, pick->crc.csum, csum);
-		printf("%s\n", buf.buf);
-		printbuf_exit(&buf);
+		print_bch(bch2_csum_err_msg(&buf, pick->crc.csum_type, pick->crc.csum, csum));
 		return -1;
 	}
 
@@ -385,10 +376,8 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 		bch2_mark_io_failure(ctx->failed, &pick, ctx->failed_csum);
 		rc = ctx->failed->nr;
 
-		struct printbuf buf = PRINTBUF;
-		bch2_extent_ptr_to_text(&buf, fs, &pick.ptr);
-		printf("WARN: Read attempt %d failed: %s\nRetrying...\n", ctx->failed->nr, buf.buf);
-		printbuf_exit(&buf);
+		printf("WARN: Read attempt %d failed: ", ctx->failed->nr);
+		print_bch(bch2_extent_ptr_to_text(&buf, fs, &pick.ptr));
 	}
 	if (orig != read_bio) {
 		bch2_bio_free_pages_pool(fs, read_bio);
@@ -549,34 +538,32 @@ static int process_bkey(struct recover_settings *settings, struct bch_fs *fs, st
 		return 0;
 	}
 
+	int rc = 0;
 	switch (s_c->k->type) {
 		case KEY_TYPE_dirent:
-			if (recover_unlink_details(settings, fs, s_c) < 0) {
-				print_bkey_s_c(fs, *s_c, "ERROR: problem while processing dirent");
-				return -1;
-			}
+			rc = recover_unlink_details(settings, fs, s_c);
 			break;
 		case KEY_TYPE_inode:
 		case KEY_TYPE_inode_v2:
 		case KEY_TYPE_inode_v3:
-			if (recover_inode_details(settings, fs, s_c) < 0) {
-				print_bkey_s_c(fs, *s_c, "ERROR: problem while processing inode metadata");
-				return -1;
-			}
+			rc = recover_inode_details(settings, fs, s_c);
 			break;
 		case KEY_TYPE_extent:
 		case KEY_TYPE_inline_data:
 		case KEY_TYPE_reflink_v:
 		case KEY_TYPE_indirect_inline_data:
-			if (recover_inode_data(settings, fs, s_c) < 0) {
-				print_bkey_s_c(fs, *s_c, "ERROR: problem while processing extent");
-				return -1;
-			}
+			rc = recover_inode_data(settings, fs, s_c);
 			break;
 		default:
 			break;
 	}
-	return 0;
+
+	if (rc < 0) {
+		printf("ERROR: problem while processing %s: ", bch2_bkey_types[s_c->k->type]);
+		print_bch(bch2_bkey_val_to_text(&buf, fs, *s_c));
+	}
+
+	return rc;
 }
 
 static int process_jset(struct recover_settings *settings, struct bch_fs *fs, struct jset *jset)
@@ -671,10 +658,8 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 				assert(bset && csum);
 
 				if (bch2_crc_cmp(*csum, csum_calc)) {
-					struct printbuf buf = PRINTBUF;
-					bch2_csum_err_msg(&buf, BSET_CSUM_TYPE(bset), *csum, csum_calc);
-					printf("Skipping bset: %s\n", buf.buf);
-					printbuf_exit(&buf);
+					print_bch(bch2_csum_err_msg(&buf, BSET_CSUM_TYPE(bset), *csum, csum_calc));
+					printf("Skipping bset...\n");
 					continue;
 				}
 
@@ -684,13 +669,12 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 				}
 
 				if (!offset) {
-					struct printbuf buf = PRINTBUF;
-					if (bch2_bkey_format_invalid(dev->fs, &bn->format, 0, &buf)) {
-						printf("Invalid format in btree_node: %s. Skipping...\n", buf.buf);
-						printbuf_exit(&buf);
+					int rc = 0;
+					print_bch(rc = bch2_bkey_format_invalid(NULL, &bn->format, 0, &buf));
+					if (rc) {
+						printf("Skipping bucket...\n");
 						return 0;
 					}
-					printbuf_exit(&buf);
 				}
 
 				vstruct_for_each_safe(bset, pkey) {
@@ -722,10 +706,7 @@ static int process_bucket(struct recover_settings *settings, struct bch_dev *dev
 				struct nonce nonce = journal_nonce(jset);
 				struct bch_csum csum_calc = csum_vstruct(dev->fs, csum_type, nonce, jset);
 				if (bch2_crc_cmp(jset->csum, csum_calc)) {
-					struct printbuf buf = PRINTBUF;
-					bch2_csum_err_msg(&buf, csum_type, jset->csum, csum_calc);
-					printf("%s\n", buf.buf);
-					printbuf_exit(&buf);
+					print_bch(bch2_csum_err_msg(&buf, csum_type, jset->csum, csum_calc));
 					continue;
 				}
 
