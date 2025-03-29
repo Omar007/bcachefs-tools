@@ -623,105 +623,122 @@ static struct nonce journal_nonce(const struct jset *jset)
 	}};
 }
 
-static int process_bucket(struct recover_settings *settings, struct bch_dev *dev, void *data)
+static int scan_bset(struct recover_settings *settings, struct bch_dev *dev, struct btree_node *bn, u64 offset_bytes)
 {
-	u64 fs_magic_bset = bset_magic(dev->fs);
-	u64 fs_magic_jset = jset_magic(dev->fs);
+	if (le64_to_cpu(bn->magic) != bset_magic(dev->fs)) {
+		return 0;
+	}
 
-	for (u64 offset = 0, sectors = 0; offset < dev->mi.bucket_size; offset += sectors) {
-		sectors = 1;
+	struct bset *bset = NULL;
+	struct bch_csum *csum = NULL;
+	struct bch_csum csum_calc;
 
-		if (settings->scan_bset) {
-			struct btree_node *bn = data;
-			if (le64_to_cpu(bn->magic) == fs_magic_bset) {
-				struct bset *bset = NULL;
-				struct bch_csum *csum = NULL;
-				struct bch_csum csum_calc;
+	u64 sectors = 0;
+	if (!offset_bytes) {
+		verbose(settings, "Found btree_node!\n");
+		sectors = vstruct_sectors(bn, dev->fs->block_bits);
 
-				if (!offset) {
-					verbose(settings, "Found btree_node!\n");
-					sectors = vstruct_sectors(bn, dev->fs->block_bits);
-
-					bset = &bn->keys;
-					csum = &bn->csum;
-					csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, 0), bn);
-				} else {
-					verbose(settings, "Found btree_node_entry!\n");
-					struct btree_node_entry *bne = data + (offset << SECTOR_SHIFT);
-					sectors = vstruct_sectors(bne, dev->fs->block_bits);
-
-					bset = &bne->keys;
-					csum = &bne->csum;
-					csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, offset << SECTOR_SHIFT), bne);
-				}
-
-				assert(bset && csum);
-
-				if (bch2_crc_cmp(*csum, csum_calc)) {
-					print_bch(bch2_csum_err_msg(&buf, BSET_CSUM_TYPE(bset), *csum, csum_calc));
-					printf("Skipping bset...\n");
-					continue;
-				}
-
-				if (bset_encrypt(dev->fs, bset, offset << SECTOR_SHIFT)) {
-					printf("ERROR: Failed to decrypt bset.\n");
-					return -1;
-				}
-
-				if (!offset) {
-					int rc = 0;
-					print_bch(rc = bch2_bkey_format_invalid(NULL, &bn->format, 0, &buf));
-					if (rc) {
-						printf("Skipping bucket...\n");
-						return 0;
-					}
-				}
-
-				vstruct_for_each_safe(bset, pkey) {
-					struct bkey key = bkey_packed(pkey) ? __bch2_bkey_unpack_key(&bn->format, pkey) : *packed_to_bkey_c(pkey);
-					struct bkey_s_c s_c = {
-						.k = &key,
-						.v = bkeyp_val(&bn->format, pkey),
-					};
-					if (process_bkey(settings, dev->fs, &s_c) < 0) {
-						return -1;
-					}
-				}
-
-				continue;
-			}
+		bset = &bn->keys;
+		csum = &bn->csum;
+		csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, 0), bn);
+	} else {
+		struct btree_node_entry *bne = (void *) bn + offset_bytes;
+		sectors = vstruct_sectors(bne, dev->fs->block_bits);
+		if (offset_bytes + (sectors << SECTOR_SHIFT) > bucket_bytes(dev)) {
+			verbose(settings, "No more btree_node_entry items in bucket.\n");
+			return sectors;
 		}
 
-		if (settings->scan_jset) {
-			struct jset *jset = data + (offset << SECTOR_SHIFT);
-			if (le64_to_cpu(jset->magic) == fs_magic_jset) {
-				verbose(settings, "Found jset!\n");
-				sectors = vstruct_sectors(jset, dev->fs->block_bits);
+		verbose(settings, "Found btree_node_entry!\n");
 
-				if (le64_to_cpu(jset->seq) < dev->fs->journal.oldest_seq_found_ondisk) {
-					printf("Found jset record is no longer present in live journal!\n");
-				}
+		bset = &bne->keys;
+		csum = &bne->csum;
+		csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, offset_bytes), bne);
+	}
 
-				enum bch_csum_type csum_type = JSET_CSUM_TYPE(jset);
-				struct nonce nonce = journal_nonce(jset);
-				struct bch_csum csum_calc = csum_vstruct(dev->fs, csum_type, nonce, jset);
-				if (bch2_crc_cmp(jset->csum, csum_calc)) {
-					print_bch(bch2_csum_err_msg(&buf, csum_type, jset->csum, csum_calc));
-					continue;
-				}
+	assert(bset && csum);
 
-				if (bch2_encrypt(dev->fs, csum_type, nonce, jset->encrypted_start, vstruct_end(jset) - (void *) jset->encrypted_start)) {
-					printf("ERROR: Failed to decrypt jset.\n");
-					return -1;
-				}
+	if (bch2_crc_cmp(*csum, csum_calc)) {
+		print_bch(bch2_csum_err_msg(&buf, BSET_CSUM_TYPE(bset), *csum, csum_calc));
+		printf("Skipping bset...\n");
+		return sectors;
+	}
 
-				if (should_recover_jset(settings, jset) && process_jset(settings, dev->fs, jset) < 0) {
-					printf("ERROR: Failed to process jset.\n");
-					return -1;
-				}
+	if (bset_encrypt(dev->fs, bset, offset_bytes)) {
+		printf("ERROR: Failed to decrypt bset.\n");
+		return -1;
+	}
 
-				continue;
-			}
+	if (!offset_bytes) {
+		int rc = 0;
+		print_bch(rc = bch2_bkey_format_invalid(NULL, &bn->format, 0, &buf));
+		if (rc) {
+			printf("Invalid format in btree_node. Skipping bucket...\n");
+			return dev->mi.bucket_size;
+		}
+	}
+
+	vstruct_for_each_safe(bset, pkey) {
+		struct bkey key = bkey_packed(pkey) ? __bch2_bkey_unpack_key(&bn->format, pkey) : *packed_to_bkey_c(pkey);
+		struct bkey_s_c s_c = {
+			.k = &key,
+			.v = bkeyp_val(&bn->format, pkey),
+		};
+		if (process_bkey(settings, dev->fs, &s_c) < 0) {
+			return -1;
+		}
+	}
+
+	return sectors;
+}
+
+static int scan_jset(struct recover_settings *settings, struct bch_fs *fs, struct jset *jset)
+{
+	if (le64_to_cpu(jset->magic) != jset_magic(fs)) {
+		return 0;
+	}
+
+	verbose(settings, "Found jset!\n");
+
+	if (le64_to_cpu(jset->seq) < fs->journal.oldest_seq_found_ondisk) {
+		printf("Found jset record is no longer present in live journal!\n");
+	}
+
+	enum bch_csum_type csum_type = JSET_CSUM_TYPE(jset);
+	struct nonce nonce = journal_nonce(jset);
+	struct bch_csum csum_calc = csum_vstruct(fs, csum_type, nonce, jset);
+	if (bch2_crc_cmp(jset->csum, csum_calc)) {
+		print_bch(bch2_csum_err_msg(&buf, csum_type, jset->csum, csum_calc));
+		printf("Skipping jset...\n");
+		return vstruct_sectors(jset, fs->block_bits);
+	}
+
+	if (bch2_encrypt(fs, csum_type, nonce, jset->encrypted_start, vstruct_end(jset) - (void *) jset->encrypted_start)) {
+		printf("ERROR: Failed to decrypt jset.\n");
+		return -1;
+	}
+
+	if (should_recover_jset(settings, jset) && process_jset(settings, fs, jset) < 0) {
+		printf("ERROR: Failed to process jset.\n");
+		return -1;
+	}
+
+	return vstruct_sectors(jset, fs->block_bits);
+}
+
+static int scan_bucket(struct recover_settings *settings, struct bch_dev *dev, void *data)
+{
+	for (u16 offset = 0, sectors = 0; offset < dev->mi.bucket_size; offset += max(sectors, 1), sectors = 0) {
+		if (!sectors && settings->scan_bset) {
+			sectors = scan_bset(settings, dev, data, offset << SECTOR_SHIFT);
+		}
+
+		if (!sectors && settings->scan_jset) {
+			sectors = scan_jset(settings, dev->fs, data + (offset << SECTOR_SHIFT));
+		}
+
+		if (sectors < 0) {
+			return -1;
 		}
 	}
 
@@ -773,7 +790,7 @@ static int scan_members(struct recover_settings *settings, struct bch_fs *fs)
 
 			void *data_iter = data;
 			for (u64 i = 0; i < buckets_to_read; i++) {
-				if (process_bucket(settings, dev, data_iter) < 0) {
+				if (scan_bucket(settings, dev, data_iter) < 0) {
 					free(data);
 					bio_put(bio);
 					return -1;
