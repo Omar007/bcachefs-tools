@@ -26,6 +26,17 @@ extern int __must_check kstrtou8(const char *s, unsigned int base, u8 *res);
 	printbuf_exit(&buf); \
 } while (0)
 
+struct recover_stats {
+	u64 extents_total;
+	u64 extents_written;
+	u64 extents_failed;
+	u64 extents_csum;
+	u64 extents_decompress;
+	u64 files_names;
+	u64 files_inodes;
+	darray_u8 scanned_members;
+};
+
 struct recover_settings {
 	char *target_dir;
 	u64 start_time;
@@ -45,13 +56,7 @@ struct recover_settings {
 	bool exclude_live_inodes;
 	bool dry_run;
 	bool verbose;
-	u64 extents_total;
-	u64 extents_written;
-	u64 extents_failed;
-	u64 extents_csum;
-	u64 extents_decompress;
-	u64 files_names;
-	u64 files_inodes;
+	struct recover_stats *stats;
 };
 
 struct recover_context {
@@ -234,7 +239,7 @@ static int recover_unlink_details(struct recover_settings *settings, struct bch_
 
 	verbose(settings, "Symlink created: %s -> %s\n", filename, targetName);
 
-	settings->files_names++;
+	settings->stats->files_names++;
 	return 0;
 }
 
@@ -276,7 +281,7 @@ static int write_to_recovery_file(struct recover_settings *settings, struct reco
 
 	verbose(settings, "Extent written to file.\n");
 
-	settings->extents_written++;
+	settings->stats->extents_written++;
 	return 0;
 }
 
@@ -344,10 +349,10 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 
 	struct extent_ptr_decoded pick;
 	if (bch2_bkey_pick_read_device(fs, *ctx->key, ctx->failed, &pick, -1) < 0) {
-		settings->extents_failed++;
+		settings->stats->extents_failed++;
 
 		if (ctx->failed_csum) {
-			settings->extents_csum++;
+			settings->stats->extents_csum++;
 
 			if (!settings->ignore_csum) {
 				printf("ERROR: no device to read from with a valid checksum.\n");
@@ -356,7 +361,7 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 		}
 
 		if (ctx->failed_decompress) {
-			settings->extents_decompress++;
+			settings->stats->extents_decompress++;
 		}
 
 		if (settings->zero_extent) {
@@ -435,7 +440,7 @@ static int recover_inode_data(struct recover_settings *settings, struct bch_fs *
 		return 0;
 	}
 
-	settings->extents_total++;
+	settings->stats->extents_total++;
 
 	if (!size) {
 		// Shortcut for 0-byte extents; no need to read/write anything. Just create target file.
@@ -531,7 +536,7 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 
 	verbose(settings, "File truncated!\n");
 
-	settings->files_inodes++;
+	settings->stats->files_inodes++;
 	return 0;
 }
 
@@ -836,6 +841,7 @@ static int scan_members(struct recover_settings *settings, struct bch_fs *fs)
 			bucket += buckets_to_read;
 		}
 
+		darray_push(&settings->stats->scanned_members, dev->dev_idx);
 		free(data);
 	}
 
@@ -887,6 +893,16 @@ int cmd_recover_files(int argc, char *argv[])
 		{ NULL }
 	};
 
+	struct recover_stats stats = {
+		.extents_total = 0,
+		.extents_written = 0,
+		.extents_failed = 0,
+		.extents_csum = 0,
+		.extents_decompress = 0,
+		.files_names = 0,
+		.files_inodes = 0,
+		.scanned_members = {},
+	};
 	struct recover_settings settings = {
 		.target_dir = NULL,
 		.start_time = 0,
@@ -907,13 +923,7 @@ int cmd_recover_files(int argc, char *argv[])
 		.exclude_live_inodes = false,
 		.dry_run = false,
 		.verbose = false,
-		.extents_total = 0,
-		.extents_written = 0,
-		.extents_failed = 0,
-		.extents_csum = 0,
-		.extents_decompress = 0,
-		.files_names = 0,
-		.files_inodes = 0,
+		.stats = &stats,
 	};
 
 	int opt;
@@ -1037,15 +1047,23 @@ int cmd_recover_files(int argc, char *argv[])
 		printf("ERROR: Problem encountered during recovery. Aborted.\n");
 	}
 
-	printf("Recovery finished. Found %llu extents using %u recovery method(s):\n", settings.extents_total, recovery_method_count);
-	printf("  - %llu extents recovered and written\n", settings.extents_written);
-	printf("  - %llu extents with read failures\n", settings.extents_failed);
-	if (settings.extents_failed > 0) {
-		printf("    - %llu extents with csum failures\n", settings.extents_csum);
-		printf("    - %llu extents with decompress failures\n", settings.extents_decompress);
+	printf("Recovery finished. Found %llu extents using %u recovery method(s):\n", stats.extents_total, recovery_method_count);
+	printf("  - %llu extents recovered and written\n", stats.extents_written);
+	printf("  - %llu extents with read failures\n", stats.extents_failed);
+	if (stats.extents_failed > 0) {
+		printf("    - %llu extents with csum failures\n", stats.extents_csum);
+		printf("    - %llu extents with decompress failures\n", stats.extents_decompress);
 	}
-	printf("  - %llu file names recovered\n", settings.files_names);
-	printf("  - %llu file metadata recovered\n", settings.files_inodes);
+	printf("  - %llu file names recovered\n", stats.files_names);
+	printf("  - %llu file metadata recovered\n", stats.files_inodes);
+	if (settings.scan_bset || settings.scan_jset) {
+		printf("\n");
+		printf("A total of %lu out of %lu members have been scanned.\n", stats.scanned_members.nr, devs.nr);
+		printf("The following members have been fully scanned: ");
+		darray_for_each(stats.scanned_members, member) {
+			printf("%u%s", *member, *member != darray_last(stats.scanned_members) ? ", " : "\n");
+		}
+	}
 
 	bch2_fs_stop(c);
 	bch2_darray_str_exit(&devs);
@@ -1055,6 +1073,7 @@ int cmd_recover_files(int argc, char *argv[])
 	darray_exit(&settings.excluded_devs);
 	darray_exit(&settings.included_inodes);
 	darray_exit(&settings.excluded_inodes);
+	darray_exit(&stats.scanned_members);
 
 	return rc;
 }
