@@ -9,6 +9,8 @@
 #include "libbcachefs/io_write.h"
 #include "libbcachefs/journal_io.h"
 
+extern int __must_check kstrtou8(const char *s, unsigned int base, u8 *res);
+
 #define verbose(_settings, ...) do { \
 	if (_settings->verbose) { \
 		printf(__VA_ARGS__); \
@@ -36,6 +38,8 @@ struct recover_settings {
 	bool scan_jset;
 	bool use_journal;
 	u64 scan_read_limit;
+	darray_u8 included_devs;
+	darray_u8 excluded_devs;
 	darray_u64 included_inodes;
 	darray_u64 excluded_inodes;
 	bool exclude_live_inodes;
@@ -80,6 +84,8 @@ static void recover_files_usage(void)
 	     "  -J, --scan-jset            Scan each member disk for journal data. Should recover a good amount.\n"
 	     "  -j, --use-journal          Use the live journal for data recovery. Quick but less complete.\n"
 	     "  -m, --scan-read-limit      The amount of data (in GiB) to read from disk at once during scanning.\n"
+	     "  -u, --include-device       Include the given member ID during the scanning process.\n"
+	     "  -U, --exclude-device       Exclude the given member ID during the scanning process.\n"
 	     "  -i, --include-inode        Only recover data for the given inode. Can be specified multiple times.\n"
 	     "  -I, --exclude-inode        Don't recover data for the given inode. Can be specified multiple times.\n"
 	     "  -X, --exclude-live-inodes  Don't recover data for inodes that exist in the live filesystem.\n"
@@ -89,12 +95,37 @@ static void recover_files_usage(void)
 	     "Report bugs to <linux-bcachefs@vger.kernel.org>");
 }
 
+static bool should_scan_disk(struct recover_settings *settings, u8 idx)
+{
+	if (!settings->included_devs.nr && !settings->excluded_devs.nr) {
+		return true;
+	}
+
+	darray_for_each(settings->included_devs, included) {
+		if (*included == idx) {
+			return true;
+		}
+	}
+
+	darray_for_each(settings->excluded_devs, excluded) {
+		if (*excluded == idx) {
+			verbose(settings, "Skipping member %u. It is explicitly excluded.\n", idx);
+			return false;
+		}
+	}
+
+	if (settings->included_devs.nr) {
+		verbose(settings, "Skipping member %u. It has not been explicitly included.\n", idx);
+	}
+	return !settings->included_devs.nr;
+}
+
 static bool should_recover_inode(struct recover_settings *settings, struct bch_fs *fs, u64 inode)
 {
 	if (settings->exclude_live_inodes) {
 		struct bch_inode_unpacked inode_details;
 		if (!bch2_trans_do(fs, bch2_inode_find_by_inum_nowarn_trans(trans, (subvol_inum){ 1, inode }, &inode_details))) {
-			verbose(settings, "Skipping recovery. Inode %llu still exists.\n", inode);
+			verbose(settings, "Skipping recovery of inode %llu. It still exists.\n", inode);
 			return false;
 		}
 	}
@@ -111,13 +142,13 @@ static bool should_recover_inode(struct recover_settings *settings, struct bch_f
 
 	darray_for_each(settings->excluded_inodes, excluded) {
 		if (*excluded == inode) {
-			verbose(settings, "Skipping recovery. Inode %llu is explicitly excluded.\n", inode);
+			verbose(settings, "Skipping recovery of inode %llu. It is explicitly excluded.\n", inode);
 			return false;
 		}
 	}
 
 	if (settings->included_inodes.nr) {
-		verbose(settings, "Skipping recovery. Inode %llu has not been explicitly requested.\n", inode);
+		verbose(settings, "Skipping recovery of inode %llu. It has not been explicitly included.\n", inode);
 	}
 	return !settings->included_inodes.nr;
 }
@@ -754,6 +785,10 @@ static int scan_members(struct recover_settings *settings, struct bch_fs *fs)
 	}
 
 	for_each_online_member(fs, dev, 0) {
+		if (!should_scan_disk(settings, dev->dev_idx)) {
+			continue;
+		}
+
 		u64 bsize_in_bytes = bucket_bytes(dev);
 		u64 chunk_size_in_buckets = min(max(bsize_in_bytes, settings->scan_read_limit) / bsize_in_bytes, dev->mi.nbuckets);
 		u64 chunk_size_in_bytes = bsize_in_bytes * chunk_size_in_buckets;
@@ -841,6 +876,8 @@ int cmd_recover_files(int argc, char *argv[])
 		{ "scan-jset", no_argument, NULL, 'J' },
 		{ "use-journal", no_argument, NULL, 'j' },
 		{ "scan-read-limit", required_argument, NULL, 'm' },
+		{ "include-device", required_argument, NULL, 'u' },
+		{ "exclude-device", required_argument, NULL, 'U' },
 		{ "include-inode", required_argument, NULL, 'i' },
 		{ "exclude-inode", required_argument, NULL, 'I' },
 		{ "exclude-live-inodes", no_argument, NULL, 'X' },
@@ -863,6 +900,8 @@ int cmd_recover_files(int argc, char *argv[])
 		.use_journal = false,
 		// Default limit of 1 GiB
 		.scan_read_limit = (1 << 30),
+		.included_devs = {},
+		.excluded_devs = {},
 		.included_inodes = {},
 		.excluded_inodes = {},
 		.exclude_live_inodes = false,
@@ -878,7 +917,7 @@ int cmd_recover_files(int argc, char *argv[])
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "t:s:e:czZlBJjm:i:I:Xdvh", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "t:s:e:czZlBJjm:u:U:i:I:Xdvh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 't':
 			settings.target_dir = strdup(optarg);
@@ -917,6 +956,18 @@ int cmd_recover_files(int argc, char *argv[])
 			if (kstrtou64(optarg, 10, &gib_limit))
 				die("error parsing scan-read-limit value");
 			settings.scan_read_limit = gib_limit << 30;
+			break;
+		case 'u':
+			u8 include_dev = 0;
+			if (kstrtou8(optarg, 10, &include_dev))
+				die("error parsing include-device value");
+			darray_push(&settings.included_devs, include_dev);
+			break;
+		case 'U':
+			u8 exclude_dev = 0;
+			if (kstrtou8(optarg, 10, &exclude_dev))
+				die("error parsing exclude-device value");
+			darray_push(&settings.excluded_devs, exclude_dev);
 			break;
 		case 'i':
 			u64 include_inode = 0;
@@ -998,7 +1049,12 @@ int cmd_recover_files(int argc, char *argv[])
 
 	bch2_fs_stop(c);
 	bch2_darray_str_exit(&devs);
+
 	free(settings.target_dir);
+	darray_exit(&settings.included_devs);
+	darray_exit(&settings.excluded_devs);
+	darray_exit(&settings.included_inodes);
+	darray_exit(&settings.excluded_inodes);
 
 	return rc;
 }
