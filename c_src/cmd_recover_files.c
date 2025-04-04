@@ -1,4 +1,6 @@
 #include <getopt.h>
+#include <linux/xattr.h>
+#include <sys/xattr.h>
 
 #include "cmds.h"
 
@@ -8,6 +10,7 @@
 #include "libbcachefs/io_read.h"
 #include "libbcachefs/io_write.h"
 #include "libbcachefs/journal_io.h"
+#include "libbcachefs/xattr.h"
 
 extern int __must_check kstrtou8(const char *s, unsigned int base, u8 *res);
 
@@ -34,6 +37,7 @@ struct recover_stats {
 	u64 extents_decompress;
 	u64 files_names;
 	u64 files_inodes;
+	u64 xattrs;
 	darray_u8 scanned_members;
 };
 
@@ -54,6 +58,7 @@ struct recover_settings {
 	darray_u64 included_inodes;
 	darray_u64 excluded_inodes;
 	bool exclude_live_inodes;
+	bool restore_attrs;
 	bool dry_run;
 	bool verbose;
 	struct recover_stats *stats;
@@ -94,6 +99,7 @@ static void recover_files_usage(void)
 	     "  -i, --include-inode        Only recover data for the given inode. Can be specified multiple times.\n"
 	     "  -I, --exclude-inode        Don't recover data for the given inode. Can be specified multiple times.\n"
 	     "  -X, --exclude-live-inodes  Don't recover data for inodes that exist in the live filesystem.\n"
+	     "  -a, --restore-attrs        Restore (a subset of) file attributes (user, trusted, security).\n"
 	     "  -d, --dry-run              Only read, don't actually write out anything anywhere.\n"
 	     "  -v, --verbose              Enable verbose mode for disk operations.\n"
 	     "  -h, --help                 Display this help and exit.\n"
@@ -289,7 +295,7 @@ static int recovery_read_endio(struct recover_settings *settings, struct recover
 	struct bch_fs *fs, struct bio *read_bio, struct extent_ptr_decoded *pick)
 {
 	if (read_bio->bi_status) {
-		verbose(settings, "I/O error while reading extent ptr: %s (%d)\n", blk_status_to_str(read_bio->bi_status), read_bio->bi_status);
+		verbose(settings, "I/O error while reading extent ptr: %s (%u)\n", blk_status_to_str(read_bio->bi_status), read_bio->bi_status);
 		return -1;
 	}
 
@@ -384,7 +390,7 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 		return -1;
 	}
 
-	verbose(settings, "Reading from device %d...\n", pick.ptr.dev);
+	verbose(settings, "Reading from device %u...\n", pick.ptr.dev);
 
 	struct bio *read_bio = NULL;
 	if (crc_is_compressed(pick.crc)) {
@@ -412,7 +418,7 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 		bch2_mark_io_failure(ctx->failed, &pick, ctx->failed_csum);
 		rc = ctx->failed->nr;
 
-		printf("WARN: Read attempt %d failed: ", ctx->failed->nr);
+		printf("WARN: Read attempt %u failed: ", ctx->failed->nr);
 		print_bch(bch2_extent_ptr_to_text(&buf, fs, &pick.ptr));
 	}
 	if (orig != read_bio) {
@@ -540,6 +546,64 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 	return 0;
 }
 
+static int recover_inode_xattrs(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *key)
+{
+	u64 inode = key->k->p.inode;
+
+	verbose(settings, "Found xattrs for inode %llu.\n", inode);
+
+	if (!settings->restore_attrs || !should_recover_inode(settings, fs, inode) || settings->dry_run) {
+		return 0;
+	}
+
+	struct bkey_s_c_xattr xattr = bkey_s_c_to_xattr(*key);
+	char *prefix = NULL;
+	switch (xattr.v->x_type) {
+		case KEY_TYPE_XATTR_INDEX_USER:
+			prefix = XATTR_USER_PREFIX;
+			break;
+		case KEY_TYPE_XATTR_INDEX_TRUSTED:
+			prefix = XATTR_TRUSTED_PREFIX;
+			break;
+		case KEY_TYPE_XATTR_INDEX_SECURITY:
+			prefix = XATTR_SECURITY_PREFIX;
+			break;
+		default:
+			verbose(settings, "Ignoring xattr type %u. Nothing implemented.\n", xattr.v->x_type);
+			return 0;
+	}
+
+	assert(prefix);
+
+	size_t filenameSize = strlen(settings->target_dir) + 25;
+	char filename[filenameSize];
+	if (snprintf(filename, filenameSize, "%s/%llu", settings->target_dir, inode) < 0) {
+		return -1;
+	}
+
+	size_t fullnameSize = strlen(prefix) + xattr.v->x_name_len + 1;
+	char fullname[fullnameSize];
+	if (snprintf(fullname, fullnameSize, "%s%s", prefix, xattr.v->x_name) < 0) {
+		return -1;
+	}
+
+	if (lsetxattr(filename, fullname, xattr_val(xattr.v), le16_to_cpu(xattr.v->x_val_len), 0) < 0) {
+		switch (errno) {
+			case ENOENT:
+				verbose(settings, "%s does not exist. Skipping xattr...\n", filename);
+				return 0;
+			default:
+				verbose(settings, "Failed to set xattr %s on %s: %s (%d)\n", fullname, filename, strerror(errno), errno);
+				return -1;
+		}
+	}
+
+	verbose(settings, "Xattr %s set on %s!\n", fullname, filename);
+
+	settings->stats->xattrs++;
+	return 0;
+}
+
 static int process_bkey(struct recover_settings *settings, struct bch_fs *fs, struct bkey_s_c *s_c)
 {
 	struct bkey_validate_context from = {
@@ -563,6 +627,9 @@ static int process_bkey(struct recover_settings *settings, struct bch_fs *fs, st
 		case KEY_TYPE_reflink_v:
 		case KEY_TYPE_indirect_inline_data:
 			from.btree = BTREE_ID_reflink;
+			break;
+		case KEY_TYPE_xattr:
+			from.btree = BTREE_ID_xattrs;
 			break;
 		default:
 			verbose(settings, "Ignoring bkey with type %s. Nothing implemented.\n", s_c->k->type < KEY_TYPE_MAX ? bch2_bkey_types[s_c->k->type] : "invalid");
@@ -589,6 +656,9 @@ static int process_bkey(struct recover_settings *settings, struct bch_fs *fs, st
 		case KEY_TYPE_reflink_v:
 		case KEY_TYPE_indirect_inline_data:
 			rc = recover_inode_data(settings, fs, s_c);
+			break;
+		case KEY_TYPE_xattr:
+			rc = recover_inode_xattrs(settings, fs, s_c);
 			break;
 		default:
 			break;
@@ -648,15 +718,12 @@ static int do_journal_recovery(struct recover_settings *settings, struct bch_fs 
 	return 0;
 }
 
-// Copied over from journal_io.c
-static struct nonce journal_nonce(const struct jset *jset)
+static bool is_valid_bset(struct bch_fs *fs, struct bset *bset)
 {
-	return (struct nonce) {{
-		[0] = 0,
-		[1] = ((__le32 *) &jset->seq)[0],
-		[2] = ((__le32 *) &jset->seq)[1],
-		[3] = BCH_NONCE_JOURNAL,
-	}};
+	return bch2_version_compatible(bset->version)
+		&& bset->version >= fs->sb.version_min
+		&& BCH_VERSION_MAJOR(bset->version) <= BCH_VERSION_MAJOR(fs->sb.version)
+		&& !BSET_SEPARATE_WHITEOUTS(bset);
 }
 
 static int scan_bset(struct recover_settings *settings, struct bch_dev *dev, struct btree_node *bn, u64 offset_bytes)
@@ -667,33 +734,30 @@ static int scan_bset(struct recover_settings *settings, struct bch_dev *dev, str
 
 	struct bset *bset = NULL;
 	struct bch_csum *csum = NULL;
-	struct bch_csum csum_calc;
-
-	u64 sectors = 0;
+	unsigned sectors = 0;
 	if (!offset_bytes) {
-		verbose(settings, "Found btree_node!\n");
-		sectors = vstruct_sectors(bn, dev->fs->block_bits);
-
 		bset = &bn->keys;
 		csum = &bn->csum;
-		csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, 0), bn);
+		sectors = vstruct_sectors(bn, dev->fs->block_bits);
+
 	} else {
 		struct btree_node_entry *bne = (void *) bn + offset_bytes;
-		sectors = vstruct_sectors(bne, dev->fs->block_bits);
-		if (offset_bytes + (sectors << SECTOR_SHIFT) > bucket_bytes(dev)) {
-			verbose(settings, "No more btree_node_entry items in bucket.\n");
-			return sectors;
-		}
-
-		verbose(settings, "Found btree_node_entry!\n");
-
 		bset = &bne->keys;
 		csum = &bne->csum;
-		csum_calc = csum_vstruct(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, offset_bytes), bne);
+		sectors = vstruct_sectors(bne, dev->fs->block_bits);
 	}
 
-	assert(bset && csum);
+	assert(bset && csum && sectors);
 
+	unsigned offset_sectors = offset_bytes >> SECTOR_SHIFT;
+	if (!is_valid_bset(dev->fs, bset) || offset_sectors + sectors > btree_sectors(dev->fs) || BSET_OFFSET(bset) != offset_sectors) {
+		return sectors;
+	}
+
+	verbose(settings, "Found bset!\n");
+
+	const void *start = ((const void *) (bn) + offset_bytes) + sizeof(struct bch_csum);
+	struct bch_csum csum_calc = bch2_checksum(dev->fs, BSET_CSUM_TYPE(bset), btree_nonce(bset, offset_bytes), start, vstruct_end(bset) - start);
 	if (bch2_crc_cmp(*csum, csum_calc)) {
 		print_bch(bch2_csum_err_msg(&buf, BSET_CSUM_TYPE(bset), *csum, csum_calc));
 		printf("Skipping bset...\n");
@@ -706,6 +770,7 @@ static int scan_bset(struct recover_settings *settings, struct bch_dev *dev, str
 	}
 
 	if (!offset_bytes) {
+		// This needs to happen after decryption.
 		int rc = 0;
 		print_bch(rc = bch2_bkey_format_invalid(NULL, &bn->format, 0, &buf));
 		if (rc) {
@@ -726,6 +791,17 @@ static int scan_bset(struct recover_settings *settings, struct bch_dev *dev, str
 	}
 
 	return sectors;
+}
+
+// Copied over from libbcachefs/journal_io.c
+static struct nonce journal_nonce(const struct jset *jset)
+{
+	return (struct nonce) {{
+		[0] = 0,
+		[1] = ((__le32 *) &jset->seq)[0],
+		[2] = ((__le32 *) &jset->seq)[1],
+		[3] = BCH_NONCE_JOURNAL,
+	}};
 }
 
 static int scan_jset(struct recover_settings *settings, struct bch_fs *fs, struct jset *jset)
@@ -764,7 +840,8 @@ static int scan_jset(struct recover_settings *settings, struct bch_fs *fs, struc
 
 static int scan_bucket(struct recover_settings *settings, struct bch_dev *dev, void *data)
 {
-	for (u16 offset = 0, sectors = 0; offset < dev->mi.bucket_size; offset += max(sectors, 1), sectors = 0) {
+	for (u16 offset = 0; offset < dev->mi.bucket_size;) {
+		int sectors = 0;
 		if (!sectors && settings->scan_bset) {
 			sectors = scan_bset(settings, dev, data, offset << SECTOR_SHIFT);
 		}
@@ -776,6 +853,8 @@ static int scan_bucket(struct recover_settings *settings, struct bch_dev *dev, v
 		if (sectors < 0) {
 			return -1;
 		}
+
+		offset += max(sectors, 1);
 	}
 
 	return 0;
@@ -798,7 +877,7 @@ static int scan_members(struct recover_settings *settings, struct bch_fs *fs)
 		u64 chunk_size_in_buckets = min(max(bsize_in_bytes, settings->scan_read_limit) / bsize_in_bytes, dev->mi.nbuckets);
 		u64 chunk_size_in_bytes = bsize_in_bytes * chunk_size_in_buckets;
 
-		verbose(settings, "Processing member %d: buckets=%llu, bsectors=%d, bsize=%llu, bsperread=%llu\n",
+		verbose(settings, "Processing member %u: buckets=%llu, bsectors=%u, bsize=%llu, bsperread=%llu\n",
 			dev->dev_idx, dev->mi.nbuckets, dev->mi.bucket_size, bsize_in_bytes, chunk_size_in_buckets);
 
 		void *data = vmalloc(chunk_size_in_bytes);
@@ -822,7 +901,7 @@ static int scan_members(struct recover_settings *settings, struct bch_fs *fs)
 			submit_bio_wait(bio);
 
 			if (bio->bi_status) {
-				printf("ERROR: unexpected I/O error while reading member disk %d: %s (%d)\n", dev->dev_idx, blk_status_to_str(bio->bi_status), bio->bi_status);
+				printf("ERROR: unexpected I/O error while reading member disk %u: %s (%u)\n", dev->dev_idx, blk_status_to_str(bio->bi_status), bio->bi_status);
 				free(data);
 				bio_put(bio);
 				return -1;
@@ -887,6 +966,7 @@ int cmd_recover_files(int argc, char *argv[])
 		{ "include-inode", required_argument, NULL, 'i' },
 		{ "exclude-inode", required_argument, NULL, 'I' },
 		{ "exclude-live-inodes", no_argument, NULL, 'X' },
+		{ "restore-attrs", no_argument, NULL, 'a' },
 		{ "dry-run", no_argument, NULL, 'd' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
@@ -901,6 +981,7 @@ int cmd_recover_files(int argc, char *argv[])
 		.extents_decompress = 0,
 		.files_names = 0,
 		.files_inodes = 0,
+		.xattrs = 0,
 		.scanned_members = {},
 	};
 	struct recover_settings settings = {
@@ -921,13 +1002,14 @@ int cmd_recover_files(int argc, char *argv[])
 		.included_inodes = {},
 		.excluded_inodes = {},
 		.exclude_live_inodes = false,
+		.restore_attrs = false,
 		.dry_run = false,
 		.verbose = false,
 		.stats = &stats,
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "t:s:e:czZlBJjm:u:U:i:I:Xdvh", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "t:s:e:czZlBJjm:u:U:i:I:Xadvh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 't':
 			settings.target_dir = strdup(optarg);
@@ -994,6 +1076,9 @@ int cmd_recover_files(int argc, char *argv[])
 		case 'X':
 			settings.exclude_live_inodes = true;
 			break;
+		case 'a':
+			settings.restore_attrs = true;
+			break;
 		case 'd':
 			settings.dry_run = true;
 			break;
@@ -1056,6 +1141,7 @@ int cmd_recover_files(int argc, char *argv[])
 	}
 	printf("  - %llu file names recovered\n", stats.files_names);
 	printf("  - %llu file metadata recovered\n", stats.files_inodes);
+	printf("  - %llu xattrs recovered\n", stats.xattrs);
 	if (settings.scan_bset || settings.scan_jset) {
 		printf("\n");
 		printf("A total of %lu out of %lu members have been scanned.\n", stats.scanned_members.nr, devs.nr);
