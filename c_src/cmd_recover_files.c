@@ -59,6 +59,7 @@ struct recover_settings {
 	darray_u64 excluded_inodes;
 	bool exclude_live_inodes;
 	bool restore_attrs;
+	bool restore_ownership;
 	bool dry_run;
 	bool verbose;
 	struct recover_stats *stats;
@@ -100,6 +101,7 @@ static void recover_files_usage(void)
 	     "  -I, --exclude-inode        Don't recover data for the given inode. Can be specified multiple times.\n"
 	     "  -X, --exclude-live-inodes  Don't recover data for inodes that exist in the live filesystem.\n"
 	     "  -a, --restore-attrs        Restore (a subset of) file attributes (user, trusted, security).\n"
+	     "  -o, --restore-ownership    Restore uid/gid/mode. Run restore as root to avoid skips due to EPERM.\n"
 	     "  -d, --dry-run              Only read, don't actually write out anything anywhere.\n"
 	     "  -v, --verbose              Enable verbose mode for disk operations.\n"
 	     "  -h, --help                 Display this help and exit.\n"
@@ -513,34 +515,57 @@ static int recover_inode_details(struct recover_settings *settings, struct bch_f
 		return 0;
 	}
 
-	if (!inode_details.bi_size) {
-		// Do not truncate recovered files to 0...
-		return 0;
-	}
-
 	size_t filenameSize = strlen(settings->target_dir) + 25;
 	char filename[filenameSize];
 	if (snprintf(filename, filenameSize, "%s/%llu", settings->target_dir, inode) < 0) {
 		return -1;
 	}
 
-	verbose(settings, "Updating file size for %s to %llu bytes...\n", filename, inode_details.bi_size);
-
-	if (truncate(filename, inode_details.bi_size) < 0) {
-		switch (errno) {
-			case ENOENT:
-				verbose(settings, "%s does not exist. Skipping truncation...\n", filename);
-				return 0;
-			case EINVAL:
-				verbose(settings, "%s not a file or smaller than target. Skipping truncation...\n", filename);
-				return 0;
-			default:
-				verbose(settings, "Failed to truncate file %s: %s (%d)\n", filename, strerror(errno), errno);
-				return -1;
+	if (inode_details.bi_size) {
+		verbose(settings, "Truncating %s to %llu bytes...\n", filename, inode_details.bi_size);
+		if (truncate(filename, inode_details.bi_size) < 0) {
+			switch (errno) {
+				case ENOENT:
+					verbose(settings, "%s does not exist. Skipping truncation...\n", filename);
+					break;
+				case EINVAL:
+					verbose(settings, "%s not a file or smaller than target. Skipping truncation...\n", filename);
+					break;
+				default:
+					verbose(settings, "Failed to truncate file %s: %s (%d)\n", filename, strerror(errno), errno);
+					return -1;
+			}
 		}
 	}
 
-	verbose(settings, "File truncated!\n");
+	if (settings->restore_ownership) {
+		verbose(settings, "Setting ownership for %s to %u:%u...\n", filename, inode_details.bi_uid, inode_details.bi_gid);
+		if (lchown(filename, inode_details.bi_uid, inode_details.bi_gid) < 0) {
+			switch (errno) {
+				case ENOENT:
+					verbose(settings, "%s does not exist. Skipping ownership update...\n", filename);
+					break;
+				case EPERM:
+					verbose(settings, "Insufficient permissions to set ownership on %s. Skipping...\n", filename);
+					break;
+				default:
+					verbose(settings, "Failed to set ownership on file %s: %s (%d)\n", filename, strerror(errno), errno);
+					return -1;
+			}
+		}
+
+		verbose(settings, "Setting mode for %s to %o...\n", filename, inode_details.bi_mode);
+		if (chmod(filename, inode_details.bi_mode) < 0) {
+			switch (errno) {
+				case ENOENT:
+					verbose(settings, "%s does not exist. Skipping mode update...\n", filename);
+					break;
+				default:
+					verbose(settings, "Failed to set mode on file %s: %s (%d)\n", filename, strerror(errno), errno);
+					return -1;
+			}
+		}
+	}
 
 	settings->stats->files_inodes++;
 	return 0;
@@ -967,6 +992,7 @@ int cmd_recover_files(int argc, char *argv[])
 		{ "exclude-inode", required_argument, NULL, 'I' },
 		{ "exclude-live-inodes", no_argument, NULL, 'X' },
 		{ "restore-attrs", no_argument, NULL, 'a' },
+		{ "restore-ownership", no_argument, NULL, 'o' },
 		{ "dry-run", no_argument, NULL, 'd' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
@@ -1003,13 +1029,14 @@ int cmd_recover_files(int argc, char *argv[])
 		.excluded_inodes = {},
 		.exclude_live_inodes = false,
 		.restore_attrs = false,
+		.restore_ownership = false,
 		.dry_run = false,
 		.verbose = false,
 		.stats = &stats,
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "t:s:e:czZlBJjm:u:U:i:I:Xadvh", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "t:s:e:czZlBJjm:u:U:i:I:Xaodvh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 't':
 			settings.target_dir = strdup(optarg);
@@ -1078,6 +1105,9 @@ int cmd_recover_files(int argc, char *argv[])
 			break;
 		case 'a':
 			settings.restore_attrs = true;
+			break;
+		case 'o':
+			settings.restore_ownership = true;
 			break;
 		case 'd':
 			settings.dry_run = true;
