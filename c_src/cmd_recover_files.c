@@ -49,6 +49,7 @@ struct recover_settings {
 	bool zero_extent;
 	bool skip_extent;
 	bool use_last_extent;
+	bool skip_stale;
 	bool scan_bset;
 	bool scan_jset;
 	bool use_journal;
@@ -91,6 +92,7 @@ static void recover_files_usage(void)
 	     "  -z, --zero-extent          Zero fill extent data if it can not (reliably) be read.\n"
 	     "  -Z, --skip-extent          Skip and don't write any extent data if it can not (reliably) be read.\n"
 	     "  -l, --last-read-extent     Write out last read extent data if it can not (reliably) be read.\n"
+	     "  -p, --skip-stale-ptr       Skip stale extent pointers if encountered.\n"
 	     "  -B, --scan-bset            Scan each member disk for extent data. Slow but should recover as much as possible.\n"
 	     "  -J, --scan-jset            Scan each member disk for journal data. Should recover a good amount.\n"
 	     "  -j, --use-journal          Use the live journal for data recovery. Quick but less complete.\n"
@@ -390,6 +392,10 @@ static int recovery_read_extent(struct recover_settings *settings, struct recove
 
 		printf("ERROR: no device to read from.\n");
 		return -1;
+	} else if (settings->skip_stale && dev_ptr_stale(bch2_dev_tryget(fs, pick.ptr.dev), &pick.ptr)) {
+		verbose(settings, "Extent pointer is stale. Skipping...\n");
+		bch2_mark_io_failure(ctx->failed, &pick, false);
+		return ctx->failed->nr;
 	}
 
 	verbose(settings, "Reading from device %u...\n", pick.ptr.dev);
@@ -982,6 +988,7 @@ int cmd_recover_files(int argc, char *argv[])
 		{ "zero-extent", no_argument, NULL, 'z' },
 		{ "skip-extent", no_argument, NULL, 'Z' },
 		{ "last-read-extent", no_argument, NULL, 'l' },
+		{ "skip-stale-ptr", no_argument, NULL, 'p' },
 		{ "scan-bset", no_argument, NULL, 'B' },
 		{ "scan-jset", no_argument, NULL, 'J' },
 		{ "use-journal", no_argument, NULL, 'j' },
@@ -1018,6 +1025,7 @@ int cmd_recover_files(int argc, char *argv[])
 		.zero_extent = false,
 		.skip_extent = false,
 		.use_last_extent = false,
+		.skip_stale = false,
 		.scan_bset = false,
 		.scan_jset = false,
 		.use_journal = false,
@@ -1036,7 +1044,7 @@ int cmd_recover_files(int argc, char *argv[])
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "t:s:e:czZlBJjm:u:U:i:I:Xaodvh", longopts, NULL)) != -1)
+	while ((opt = getopt_long(argc, argv, "t:s:e:czZlpBJjm:u:U:i:I:Xaodvh", longopts, NULL)) != -1)
 		switch (opt) {
 		case 't':
 			settings.target_dir = strdup(optarg);
@@ -1060,6 +1068,9 @@ int cmd_recover_files(int argc, char *argv[])
 			break;
 		case 'l':
 			settings.use_last_extent = true;
+			break;
+		case 'p':
+			settings.skip_stale = true;
 			break;
 		case 'B':
 			settings.scan_bset = true;
