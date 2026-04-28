@@ -15,6 +15,7 @@ use crossterm::{
     execute,
     terminal::{self, ClearType},
 };
+use owo_colors::OwoColorize;
 use serde::Deserialize;
 
 use crate::util::{fmt_bytes_human, fmt_num_human, run_tui};
@@ -130,6 +131,30 @@ pub struct Cli {
 
 // TUI state
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Base,
+    Devices,
+}
+
+impl Page {
+    const ALL: &'static [Page] = &[Page::Base, Page::Devices];
+    fn label(self) -> &'static str {
+        match self {
+            Page::Base    => "counters",
+            Page::Devices => "devices",
+        }
+    }
+    fn next(self) -> Page {
+        let i = Self::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+    fn prev(self) -> Page {
+        let i = Self::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
 struct TopState {
     ioctl_fd:       i32,
     nr_stable:      u16,
@@ -138,9 +163,11 @@ struct TopState {
     prev_vals:      Vec<u64>,
     prev_dev_io:    HashMap<String, (u64, u64)>,    // label -> (read, write)
     human_readable: bool,
-    show_devices:   bool,
     sysfs_path:     PathBuf,
     interval_secs:  u32,
+    page:           Page,
+    cursor:         usize,
+    scroll_offset:  usize,
 }
 
 impl TopState {
@@ -158,8 +185,11 @@ impl TopState {
             ioctl_fd, nr_stable,
             mount_vals, start_vals, prev_vals,
             prev_dev_io: HashMap::new(),
-            human_readable, show_devices: true,
+            human_readable,
             sysfs_path, interval_secs: 1,
+            page: Page::Base,
+            cursor: 0,
+            scroll_offset: 0,
         })
     }
 
@@ -167,58 +197,127 @@ impl TopState {
         let idx = stable_id as usize;
         if idx < vals.len() { vals[idx] } else { 0 }
     }
+}
 
-    fn render(&self, curr: &[u64], dev_io: &[DevIoEntry], stdout: &mut io::Stdout) -> io::Result<()> {
-        execute!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
+/* Build the current frame as Vec<String>, return the line index of the
+ * cursor row so the caller can adjust scroll_offset to keep it visible.
+ * Total visible rows on this page is also returned (for cursor clamping). */
+fn build_frame(state: &TopState, curr: &[u64], dev_io: &[DevIoEntry])
+    -> (Vec<String>, Option<usize>, usize)
+{
+    let mut lines = Vec::new();
+    let mut cursor_line = None;
+    let mut row = 0usize;
 
-        write!(stdout, "All counters have a corresponding tracepoint; for more info on any given event, try e.g.\r\n")?;
-        write!(stdout, "  perf trace -e bcachefs:data_update_pred\r\n\r\n")?;
-        write!(stdout, "  q:quit  h:human-readable  d:devices  1-9:interval\r\n\r\n")?;
+    lines.push("All counters have a corresponding tracepoint; for more info on any given event, try e.g.".into());
+    lines.push("  perf trace -e bcachefs:data_update_pred".into());
+    lines.push(String::new());
+    lines.push("  q:quit  h:human-readable  Tab:page  \u{2191}\u{2193}:scroll  PgUp/PgDn  1-9:interval".into());
 
-        write!(stdout, "{:<40} {:>14} {:>14} {:>14}\r\n",
-            "", format!("{}/s", self.interval_secs), "total", "mount")?;
-
-        for c in COUNTERS {
-            let cv = Self::get_val(curr, c.stable_id);
-            let pv = Self::get_val(&self.prev_vals, c.stable_id);
-            let sv = Self::get_val(&self.start_vals, c.stable_id);
-            let mv = Self::get_val(&self.mount_vals, c.stable_id);
-
-            let v_mount = cv.wrapping_sub(mv);
-            if v_mount == 0 { continue }
-
-            let v_rate  = cv.wrapping_sub(pv);
-            let v_total = cv.wrapping_sub(sv);
-
-            write!(stdout, "{:<40} {:>12}/s {:>14} {:>14}\r\n",
-                c.name,
-                fmt_counter(v_rate / self.interval_secs as u64, c.is_sectors, self.human_readable),
-                fmt_counter(v_total, c.is_sectors, self.human_readable),
-                fmt_counter(v_mount, c.is_sectors, self.human_readable))?;
+    /* Page tab bar */
+    let mut tabs = String::from("  ");
+    for (i, &p) in Page::ALL.iter().enumerate() {
+        if i > 0 { tabs.push_str("  "); }
+        let label = format!("[{}]", p.label());
+        if p == state.page {
+            tabs.push_str(&format!("{}", label.reversed()));
+        } else {
+            tabs.push_str(&label);
         }
+    }
+    lines.push(tabs);
+    lines.push(String::new());
 
-        if self.show_devices && !dev_io.is_empty() {
-            write!(stdout, "\r\nPer-device IO:\r\n")?;
-            write!(stdout, "{:<40} {:>14} {:>14} {:>14} {:>14}\r\n",
-                "", "read/s", "read", "write/s", "write")?;
+    let h = state.human_readable;
+    let interval = state.interval_secs as u64;
+
+    match state.page {
+        Page::Base => {
+            lines.push(format!("{:<40} {:>14} {:>14} {:>14}",
+                "", format!("{}/s", state.interval_secs), "total", "mount"));
+
+            for c in COUNTERS {
+                let cv = TopState::get_val(curr, c.stable_id);
+                let pv = TopState::get_val(&state.prev_vals, c.stable_id);
+                let sv = TopState::get_val(&state.start_vals, c.stable_id);
+                let mv = TopState::get_val(&state.mount_vals, c.stable_id);
+
+                let v_mount = cv.wrapping_sub(mv);
+                if v_mount == 0 { continue }
+
+                let v_rate  = cv.wrapping_sub(pv);
+                let v_total = cv.wrapping_sub(sv);
+
+                let row_str = format!("{:<40} {:>12}/s {:>14} {:>14}",
+                    c.name,
+                    fmt_counter(v_rate / interval, c.is_sectors, h),
+                    fmt_counter(v_total, c.is_sectors, h),
+                    fmt_counter(v_mount, c.is_sectors, h));
+
+                if row == state.cursor {
+                    cursor_line = Some(lines.len());
+                    lines.push(format!("{}{}", "\u{25ba} ".bold(), row_str.bold()));
+                } else {
+                    lines.push(format!("  {}", row_str));
+                }
+                row += 1;
+            }
+        }
+        Page::Devices => {
+            lines.push(format!("{:<40} {:>14} {:>14} {:>14} {:>14}",
+                "", "read/s", "read", "write/s", "write"));
+
             for dev in dev_io {
-                let (prev_r, prev_w) = self.prev_dev_io
+                let (prev_r, prev_w) = state.prev_dev_io
                     .get(&dev.label)
                     .copied()
                     .unwrap_or((dev.read_bytes, dev.write_bytes));
-                let rate_r = dev.read_bytes.wrapping_sub(prev_r) / self.interval_secs as u64;
-                let rate_w = dev.write_bytes.wrapping_sub(prev_w) / self.interval_secs as u64;
+                let rate_r = dev.read_bytes.wrapping_sub(prev_r) / interval;
+                let rate_w = dev.write_bytes.wrapping_sub(prev_w) / interval;
 
-                let h = self.human_readable;
-                write!(stdout, "{:<40} {:>14} {:>14} {:>14} {:>14}\r\n",
+                let row_str = format!("{:<40} {:>14} {:>14} {:>14} {:>14}",
                     &dev.label,
                     fmt_bytes(rate_r, h), fmt_bytes(dev.read_bytes, h),
-                    fmt_bytes(rate_w, h), fmt_bytes(dev.write_bytes, h))?;
+                    fmt_bytes(rate_w, h), fmt_bytes(dev.write_bytes, h));
+
+                if row == state.cursor {
+                    cursor_line = Some(lines.len());
+                    lines.push(format!("{}{}", "\u{25ba} ".bold(), row_str.bold()));
+                } else {
+                    lines.push(format!("  {}", row_str));
+                }
+                row += 1;
             }
         }
-
-        stdout.flush()
     }
+
+    (lines, cursor_line, row)
+}
+
+fn render(state: &mut TopState, curr: &[u64], dev_io: &[DevIoEntry], stdout: &mut io::Stdout)
+    -> io::Result<usize>
+{
+    let (_, term_h) = terminal::size().unwrap_or((120, 40));
+    let visible = (term_h as usize).saturating_sub(1).max(1);
+
+    let (lines, cursor_line, total_rows) = build_frame(state, curr, dev_io);
+
+    if let Some(cl) = cursor_line {
+        if cl < state.scroll_offset {
+            state.scroll_offset = cl;
+        } else if cl >= state.scroll_offset + visible {
+            state.scroll_offset = cl - visible + 1;
+        }
+    } else if state.scroll_offset >= lines.len() {
+        state.scroll_offset = lines.len().saturating_sub(1);
+    }
+
+    execute!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
+    for line in lines.iter().skip(state.scroll_offset).take(visible) {
+        write!(stdout, "{}\r\n", line)?;
+    }
+    stdout.flush()?;
+    Ok(total_rows)
 }
 
 fn run_interactive(handle: BcachefsHandle, human_readable: bool) -> Result<()> {
@@ -227,19 +326,51 @@ fn run_interactive(handle: BcachefsHandle, human_readable: bool) -> Result<()> {
     run_tui(|stdout| loop {
         let curr = read_counters(state.ioctl_fd, 0, state.nr_stable)?;
         let dev_io = read_device_io(&state.sysfs_path);
-        state.render(&curr, &dev_io, stdout)?;
+        let total_rows = render(&mut state, &curr, &dev_io, stdout)?;
         state.prev_vals = curr;
         state.prev_dev_io = dev_io.into_iter()
             .map(|d| (d.label, (d.read_bytes, d.write_bytes)))
             .collect();
 
+        /* Clamp cursor to current page's row count (e.g. counters can drop
+         * out from under us when v_mount goes back to zero between ticks). */
+        if total_rows > 0 && state.cursor >= total_rows {
+            state.cursor = total_rows - 1;
+        }
+
         if event::poll(Duration::from_secs(state.interval_secs as u64))? {
             if let Event::Key(key) = event::read()? {
+                let (_, term_h) = terminal::size().unwrap_or((120, 40));
+                let page_step = (term_h as usize).saturating_sub(1).max(1);
+
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                    KeyCode::Tab => {
+                        state.page = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            state.page.prev()
+                        } else {
+                            state.page.next()
+                        };
+                        state.cursor = 0;
+                        state.scroll_offset = 0;
+                    }
+                    KeyCode::BackTab => {
+                        state.page = state.page.prev();
+                        state.cursor = 0;
+                        state.scroll_offset = 0;
+                    }
+                    KeyCode::Up   => state.cursor = state.cursor.saturating_sub(1),
+                    KeyCode::Down => if total_rows > 0 {
+                        state.cursor = (state.cursor + 1).min(total_rows - 1);
+                    },
+                    KeyCode::PageUp   => state.cursor = state.cursor.saturating_sub(page_step),
+                    KeyCode::PageDown => if total_rows > 0 {
+                        state.cursor = (state.cursor + page_step).min(total_rows - 1);
+                    },
+                    KeyCode::Home => state.cursor = 0,
+                    KeyCode::End  => if total_rows > 0 { state.cursor = total_rows - 1; },
                     KeyCode::Char('h') => state.human_readable = !state.human_readable,
-                    KeyCode::Char('d') => state.show_devices = !state.show_devices,
                     KeyCode::Char(c @ '1'..='9') => {
                         state.interval_secs = (c as u32) - ('0' as u32);
                     }
