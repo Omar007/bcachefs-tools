@@ -157,8 +157,8 @@ cat > "$PUBLISH_ROOT/.footer/README.html" << 'FOOTER'
 <hr>
 <h2>Adding this repository</h2>
 <pre><code>sudo install -d -m 0755 /etc/apt/keyrings
-wget -qO- https://apt.bcachefs.org/apt.bcachefs.org.pgp | sudo tee /etc/apt/keyrings/apt.bcachefs.org.pgp &gt; /dev/null
-sudo chmod 0644 /etc/apt/keyrings/apt.bcachefs.org.pgp
+wget -qO- https://apt.bcachefs.org/apt.bcachefs.org.asc | sudo tee /etc/apt/keyrings/apt.bcachefs.org.asc &gt; /dev/null
+sudo chmod 0644 /etc/apt/keyrings/apt.bcachefs.org.asc
 FOOTER
 
 # Inject the real fingerprint
@@ -173,7 +173,7 @@ Types: deb deb-src
 URIs: https://apt.bcachefs.org/unstable/
 Suites: bcachefs-tools-release
 Components: main
-Signed-By: /etc/apt/keyrings/apt.bcachefs.org.pgp
+Signed-By: /etc/apt/keyrings/apt.bcachefs.org.asc
 SOURCES
 
 sudo apt update

@@ -1,8 +1,8 @@
 To add this repository to your computer, do:
 ```bash
 sudo install -d -m 0755 /etc/apt/keyrings
-wget -qO- https://apt.bcachefs.org/apt.bcachefs.org.pgp | sudo tee /etc/apt/keyrings/apt.bcachefs.org.pgp > /dev/null
-sudo chmod 0644 /etc/apt/keyrings/apt.bcachefs.org.pgp
+wget -qO- https://apt.bcachefs.org/apt.bcachefs.org.asc | sudo tee /etc/apt/keyrings/apt.bcachefs.org.asc > /dev/null
+sudo chmod 0644 /etc/apt/keyrings/apt.bcachefs.org.asc
 # Fingerprint: EA483B991020C72A8A5035ADA0620B5E0E01C1DD
 sudo tee /etc/apt/sources.list.d/apt.bcachefs.org.sources > /dev/null <<EOF
 Types: deb deb-src
@@ -10,7 +10,7 @@ URIs: https://apt.bcachefs.org/unstable/
 # Or replace unstable with your distro's release name
 Suites: bcachefs-tools-release
 Components: main
-Signed-By: /etc/apt/keyrings/apt.bcachefs.org.pgp
+Signed-By: /etc/apt/keyrings/apt.bcachefs.org.asc
 EOF
 sudo apt update
 sudo apt install bcachefs-tools
