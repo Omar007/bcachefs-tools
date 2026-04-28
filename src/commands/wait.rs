@@ -124,13 +124,8 @@ impl WaitInitialized {
             "adding device at {} with index {dev_idx}",
             devnode.display()
         );
-        let old = self
-            .dev_idx_by_devnode
+        self.dev_idx_by_devnode
             .insert(devnode.to_path_buf(), dev_idx);
-        assert!(
-            old.is_none(),
-            "device should have have been removed before readding"
-        );
         Ok(())
     }
 
