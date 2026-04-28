@@ -1,4 +1,4 @@
-/bcachefs-wait@.service
+/bcachefs-wait-devices@.service
 /result
 bcachefs.5
 .*

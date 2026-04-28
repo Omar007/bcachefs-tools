@@ -28,7 +28,7 @@ pub struct Cli {
     device: String,
 }
 
-fn cmd_wait(cli: Cli) -> anyhow::Result<()> {
+fn cmd_wait_devices(cli: Cli) -> anyhow::Result<()> {
     let Some(uuid) = device_scan::parse_uuid_equals(&cli.device)? else {
         bail!("invalid device string: {}", cli.device);
     };
@@ -168,4 +168,4 @@ impl WaitInitialized {
 }
 
 pub const CMD: super::CmdDef =
-    typed_cmd!("wait", "Wait until devices are initialized", Cli, cmd_wait);
+    typed_cmd!("wait-devices", "Wait until every device in a filesystem is initialized", Cli, cmd_wait_devices);

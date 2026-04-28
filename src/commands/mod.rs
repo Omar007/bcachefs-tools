@@ -101,7 +101,7 @@ pub mod super_cmd;
 pub mod timestats;
 pub mod top;
 pub mod unpoison;
-pub mod wait;
+pub mod wait_devices;
 
 // ── Dispatch and help ────────────────────────────────────────────────
 
@@ -204,7 +204,7 @@ pub const COMMAND_GROUPS: &[GroupDef] = &[
         &set_option::CMD, &counters::CMD, &strip_alloc::CMD,
     ]},
     GroupDef { heading: "Images",                   commands: &[&image::CMD] },
-    GroupDef { heading: "Mount",                    commands: &[&mount::CMD, &fusemount::CMD, &wait::CMD] },
+    GroupDef { heading: "Mount",                    commands: &[&mount::CMD, &fusemount::CMD, &wait_devices::CMD] },
     GroupDef { heading: "Repair",                   commands: &[&fsck::CMD, &recovery_pass::CMD] },
     GroupDef { heading: "Running filesystem",       commands: &[&FS_CMD] },
     GroupDef { heading: "Devices",                  commands: &[&device::CMD] },

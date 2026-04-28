@@ -141,8 +141,8 @@ PKGCONFIG_SERVICEDIR:=$(shell $(PKG_CONFIG) --variable=systemdsystemunitdir syst
 ifeq (,$(PKGCONFIG_SERVICEDIR))
   $(warning skipping systemd integration)
 else
-systemd_services=bcachefs-wait@.service
-built_scripts+=bcachefs-wait@.service
+systemd_services=bcachefs-wait-devices@.service
+built_scripts+=bcachefs-wait-devices@.service
 
 %.service: %.service.in
 	@echo "    [SED]    $@"
