@@ -45,8 +45,10 @@ struct TimeStats {
     count:              u64,
     duration_ns:        DurationStats,
     duration_ewma_ns:   EwmaStats,
-    between_ns:         DurationStats,
-    between_ewma_ns:    EwmaStats,
+    #[serde(rename = "between_ns")]
+    frequency_ns:       DurationStats,
+    #[serde(rename = "between_ewma_ns")]
+    frequency_ewma_ns:  EwmaStats,
 }
 
 struct StatEntry {
@@ -84,31 +86,63 @@ const NUM_COLS: usize = 9;
 const COLUMNS: &[&str; NUM_COLS] = &[
     "NAME", "COUNT",
     "DUR_MIN", "DUR_MAX", "DUR_TOTAL",
-    "MEAN", "MEAN_RECENT",
-    "STDDEV", "STDDEV_RECENT",
+    "DUR_MEAN", "DUR_STDDEV",
+    "FREQ_MEAN", "FREQ_STDDEV",
 ];
 
-fn sort_val(e: &StatEntry, col: usize) -> u64 {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Mean,
+    Recent,
+}
+
+impl View {
+    fn label(self) -> &'static str {
+        match self {
+            View::Mean   => "mean",
+            View::Recent => "recent",
+        }
+    }
+    fn toggle(self) -> View {
+        match self {
+            View::Mean   => View::Recent,
+            View::Recent => View::Mean,
+        }
+    }
+}
+
+/* (dur_mean, dur_stddev, freq_mean, freq_stddev) for the active view. */
+fn view_vals(s: &TimeStats, view: View) -> (u64, u64, u64, u64) {
+    match view {
+        View::Mean   => (s.duration_ns.mean,      s.duration_ns.stddev,
+                         s.frequency_ns.mean,     s.frequency_ns.stddev),
+        View::Recent => (s.duration_ewma_ns.mean, s.duration_ewma_ns.stddev,
+                         s.frequency_ewma_ns.mean, s.frequency_ewma_ns.stddev),
+    }
+}
+
+fn sort_val(e: &StatEntry, col: usize, view: View) -> u64 {
     let s = &e.stats;
+    let (dm, ds, fm, fs) = view_vals(s, view);
     match col {
         1 => s.count,
         2 => s.duration_ns.min,
         3 => s.duration_ns.max,
         4 => s.duration_ns.total,
-        5 => s.duration_ns.mean,
-        6 => s.duration_ewma_ns.mean,
-        7 => s.duration_ns.stddev,
-        8 => s.duration_ewma_ns.stddev,
+        5 => dm,
+        6 => ds,
+        7 => fm,
+        8 => fs,
         _ => 0,
     }
 }
 
-fn sort_entries(entries: &mut [StatEntry], sort_col: usize, reverse: bool) {
+fn sort_entries(entries: &mut [StatEntry], sort_col: usize, reverse: bool, view: View) {
     entries.sort_by(|a, b| {
         let ord = if sort_col == 0 {
             a.name.cmp(&b.name)
         } else {
-            sort_val(b, sort_col).cmp(&sort_val(a, sort_col))
+            sort_val(b, sort_col, view).cmp(&sort_val(a, sort_col, view))
         };
         if reverse { ord.reverse() } else { ord }
     });
@@ -121,19 +155,47 @@ fn format_header() -> String {
         .join(" ")
 }
 
-fn format_row(e: &StatEntry) -> String {
+fn format_row(e: &StatEntry, view: View) -> String {
     let s = &e.stats;
+    let (dm, ds, fm, fs) = view_vals(s, view);
     format!("{:<NAME_WIDTH$} {:>COL_WIDTH$} {:>COL_WIDTH$} {:>COL_WIDTH$} {:>COL_WIDTH$} {:>COL_WIDTH$} {:>COL_WIDTH$} {:>COL_WIDTH$} {:>COL_WIDTH$}",
         e.name, s.count,
         fmt_duration(s.duration_ns.min), fmt_duration(s.duration_ns.max), fmt_duration(s.duration_ns.total),
-        fmt_duration(s.duration_ns.mean), fmt_duration(s.duration_ewma_ns.mean),
-        fmt_duration(s.duration_ns.stddev), fmt_duration(s.duration_ewma_ns.stddev))
+        fmt_duration(dm), fmt_duration(ds),
+        fmt_duration(fm), fmt_duration(fs))
 }
 
 // Structured data: sections within a filesystem snapshot
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Base,
+    Trans,
+    Devices,
+}
+
+impl Page {
+    const ALL: &'static [Page] = &[Page::Base, Page::Trans, Page::Devices];
+    fn label(self) -> &'static str {
+        match self {
+            Page::Base    => "base",
+            Page::Trans   => "transactions",
+            Page::Devices => "devices",
+        }
+    }
+    fn next(self) -> Page {
+        let i = Self::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+    fn prev(self) -> Page {
+        let i = Self::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
 struct Section {
     label:   &'static str,
+    page:    Page,
     entries: Vec<StatEntry>,
 }
 
@@ -239,19 +301,21 @@ fn collect_stats(sysfs_paths: &[PathBuf], show_devices: bool) -> Result<Vec<FsSn
             .partition(|e: &StatEntry| !e.name.starts_with("blocked_"));
 
         let mut sections = vec![
-            Section { label: "Operations",  entries: ops },
-            Section { label: "Slowpath",    entries: blocked },
+            Section { label: "Operations",  page: Page::Base,    entries: ops },
+            Section { label: "Slowpath",    page: Page::Base,    entries: blocked },
         ];
-        if show_devices {
-            sections.push(Section {
-                label:   "Per-device IO latency",
-                entries: read_device_latency_stats(path)?,
-            });
-        }
         if let Ok(entries) = read_btree_trans_stats(path) {
             sections.push(Section {
                 label:   "Btree transactions",
+                page:    Page::Trans,
                 entries,
+            });
+        }
+        if show_devices {
+            sections.push(Section {
+                label:   "Per-device IO latency",
+                page:    Page::Devices,
+                entries: read_device_latency_stats(path)?,
             });
         }
 
@@ -345,6 +409,7 @@ pub struct Cli {
 fn display_stats(snaps: Vec<FsSnapshot>, cli: &Cli) -> Result<()> {
     let multi = snaps.len() > 1;
     let sort_col = cli.sort.col_index();
+    let view = View::Mean;
 
     for mut snap in snaps {
         if multi { println!("{}:", snap.label); }
@@ -353,14 +418,14 @@ fn display_stats(snaps: Vec<FsSnapshot>, cli: &Cli) -> Result<()> {
         for section in &mut snap.sections {
             if !cli.all { section.entries.retain(|e| e.stats.count > 0); }
             if section.entries.is_empty() { continue }
-            sort_entries(&mut section.entries, sort_col, false);
+            sort_entries(&mut section.entries, sort_col, false, view);
 
             if !first { println!(); }
             first = false;
             println!("{}:", section.label);
             println!("  {}", format_header());
             for e in &section.entries {
-                println!("  {}", format_row(e));
+                println!("  {}", format_row(e, view));
             }
         }
         println!();
@@ -377,6 +442,8 @@ struct TuiState {
     show_devices:   bool,
     paused:         bool,
     interval:       Duration,
+    page:           Page,
+    view:           View,
     cursor:         usize,
     scroll_offset:  usize,
 }
@@ -404,9 +471,23 @@ fn build_frame(snaps: &[FsSnapshot], state: &TuiState, multi: bool) -> (Vec<Stri
 
     let pause = if state.paused { " PAUSED" } else { "" };
     lines.push(format!(
-        "bcachefs timestats ({}s{})  q:quit  \u{2190}\u{2192}:sort column  r:reverse  a:show all  d:devices  p:pause  1-9:interval",
+        "bcachefs timestats ({}s{})  q:quit  Tab:page  \u{2190}\u{2192}:sort  r:reverse  a:all  e:view  p:pause  1-9:interval",
         state.interval.as_secs(), pause,
     ));
+
+    /* Page tab bar + view indicator */
+    let mut tabs = String::new();
+    for (i, &p) in Page::ALL.iter().enumerate() {
+        if i > 0 { tabs.push_str("  "); }
+        let label = format!("[{}]", p.label());
+        if p == state.page {
+            tabs.push_str(&format!("{}", label.reversed()));
+        } else {
+            tabs.push_str(&label);
+        }
+    }
+    tabs.push_str(&format!("    view: {}", state.view.label()));
+    lines.push(tabs);
     lines.push(String::new());
 
     let header = format_tui_header(state.sort_col, state.reverse);
@@ -415,7 +496,7 @@ fn build_frame(snaps: &[FsSnapshot], state: &TuiState, multi: bool) -> (Vec<Stri
         if multi { lines.push(format!("{}:", snap.label)); }
 
         let mut first = true;
-        for section in &snap.sections {
+        for section in snap.sections.iter().filter(|s| s.page == state.page) {
             if section.entries.is_empty() { continue }
 
             if !first { lines.push(String::new()); }
@@ -423,7 +504,7 @@ fn build_frame(snaps: &[FsSnapshot], state: &TuiState, multi: bool) -> (Vec<Stri
             lines.push(format!("{}:", section.label));
             lines.push(header.clone());
             for entry in &section.entries {
-                let row_str = format_row(entry);
+                let row_str = format_row(entry, state.view);
                 if row == state.cursor {
                     cursor_line = Some(lines.len());
                     lines.push(format!("{}{}", "\u{25ba} ".bold(), row_str.bold()));
@@ -469,13 +550,35 @@ fn handle_key(state: &mut TuiState, key: KeyCode, modifiers: KeyModifiers, total
     match key {
         KeyCode::Char('q') | KeyCode::Esc => return true,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
+        KeyCode::Tab => {
+            state.page = if modifiers.contains(KeyModifiers::SHIFT) { state.page.prev() } else { state.page.next() };
+            state.cursor = 0;
+            state.scroll_offset = 0;
+        }
+        KeyCode::BackTab => {
+            state.page = state.page.prev();
+            state.cursor = 0;
+            state.scroll_offset = 0;
+        }
         KeyCode::Left   => state.sort_col = state.sort_col.saturating_sub(1),
         KeyCode::Right  => state.sort_col = (state.sort_col + 1).min(NUM_COLS - 1),
         KeyCode::Up     => state.cursor = state.cursor.saturating_sub(1),
         KeyCode::Down   => if total_rows > 0 { state.cursor = (state.cursor + 1).min(total_rows - 1) },
+        KeyCode::PageUp   => {
+            let (_, h) = terminal::size().unwrap_or((120, 40));
+            let step = (h as usize).saturating_sub(1).max(1);
+            state.cursor = state.cursor.saturating_sub(step);
+        }
+        KeyCode::PageDown => if total_rows > 0 {
+            let (_, h) = terminal::size().unwrap_or((120, 40));
+            let step = (h as usize).saturating_sub(1).max(1);
+            state.cursor = (state.cursor + step).min(total_rows - 1);
+        },
+        KeyCode::Home => state.cursor = 0,
+        KeyCode::End  => if total_rows > 0 { state.cursor = total_rows - 1; },
         KeyCode::Char('r') => state.reverse = !state.reverse,
         KeyCode::Char('a') => state.show_all = !state.show_all,
-        KeyCode::Char('d') => state.show_devices = !state.show_devices,
+        KeyCode::Char('e') => state.view = state.view.toggle(),
         KeyCode::Char('p') => state.paused = !state.paused,
         KeyCode::Char(c @ '1'..='9') => state.interval = Duration::from_secs((c as u64) - ('0' as u64)),
         _ => {}
@@ -491,19 +594,24 @@ fn run_interactive(cli: Cli, sysfs_paths: Vec<PathBuf>) -> Result<()> {
         show_devices:  !cli.no_device_stats,
         paused:        false,
         interval:      Duration::from_secs_f64(cli.interval),
+        page:          Page::Base,
+        view:          View::Mean,
         cursor:        0,
         scroll_offset: 0,
     };
 
     run_tui(|stdout| loop {
-        let mut snaps = collect_stats(&sysfs_paths, state.show_devices)
+        /* Only collect per-device stats when we're actually on the devices page —
+         * skips the 63-device sysfs read cost on the other pages. */
+        let want_devices = state.show_devices && state.page == Page::Devices;
+        let mut snaps = collect_stats(&sysfs_paths, want_devices)
             .unwrap_or_default();
         for snap in &mut snaps {
             for section in &mut snap.sections {
                 if !state.show_all {
                     section.entries.retain(|e| e.stats.count > 0);
                 }
-                sort_entries(&mut section.entries, state.sort_col, state.reverse);
+                sort_entries(&mut section.entries, state.sort_col, state.reverse, state.view);
             }
         }
         let total_rows: usize = snaps.iter()
