@@ -146,8 +146,14 @@ jobs:
           ${{ secrets.GPG_SECRET_SUBKEYS }}
           EOT
           set -xe
+          install -d -m 0755 /etc/apt/keyrings
           gpg \
-            --output /etc/apt/trusted.gpg.d/apt.bcachefs.org.asc \
+            --output /etc/apt/keyrings/apt.bcachefs.org.pgp \
+            --export \
+            ${{ secrets.GPG_SIGNING_SUBKEY_FINGERPRINT }} \
+          ;
+          gpg \
+            --output /etc/apt/keyrings/apt.bcachefs.org.asc \
             --armor \
             --export \
             ${{ secrets.GPG_SIGNING_SUBKEY_FINGERPRINT }} \
@@ -157,7 +163,7 @@ jobs:
             --no-default-keyring \
             --keyring ~/.gnupg/trustedkeys.gpg \
             --import \
-            /etc/apt/trusted.gpg.d/apt.bcachefs.org.asc \
+            /etc/apt/keyrings/apt.bcachefs.org.pgp \
           ;
       - name: Ensure that the download directory does not exist
         timeout-minutes: 1

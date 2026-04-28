@@ -130,16 +130,17 @@ jobs:
         shell: sudo podman exec --interactive --tty container eatmydata sh "{0}"
         run: |
           set -xe
+          install -d -m 0755 /etc/apt/keyrings
           gpg --import <<EOT
           ${{ secrets.GPG_SECRET_SUBKEYS }}
           EOT
           gpg \
-            --output /etc/apt/trusted.gpg.d/apt.bcachefs.org.gpg \
+            --output /etc/apt/keyrings/apt.bcachefs.org.pgp \
             --export \
             ${{ secrets.GPG_SIGNING_SUBKEY_FINGERPRINT }} \
           ;
           gpg \
-            --output /etc/apt/trusted.gpg.d/apt.bcachefs.org.asc \
+            --output /etc/apt/keyrings/apt.bcachefs.org.asc \
             --armor \
             --export \
             ${{ secrets.GPG_SIGNING_SUBKEY_FINGERPRINT }} \
@@ -149,7 +150,7 @@ jobs:
             --no-default-keyring \
             --keyring ~/.gnupg/trustedkeys.gpg \
             --import \
-            /etc/apt/trusted.gpg.d/apt.bcachefs.org.asc \
+            /etc/apt/keyrings/apt.bcachefs.org.pgp \
           ;
           tee -a ~/.gnupg/gpg.conf > /dev/null <<EOT
           default-key ${{ secrets.GPG_SIGNING_SUBKEY_FINGERPRINT }}
@@ -243,7 +244,7 @@ jobs:
           KEY_DIR="/usr/share/debsig/keyrings/${{ secrets.GPG_SIGNING_SUBKEY_FINGERPRINT }}"
           mkdir $POL_DIR
           mkdir $KEY_DIR
-          cp /etc/apt/trusted.gpg.d/apt.bcachefs.org.gpg $KEY_DIR/
+          cp /etc/apt/keyrings/apt.bcachefs.org.pgp "$KEY_DIR/apt.bcachefs.org.gpg"
           tee $POL_DIR/pol.pol > /dev/null <<EOT
           <?xml version="1.0"?>
           <!DOCTYPE Policy SYSTEM "https://www.debian.org/debsig/1.0/policy.dtd">
@@ -305,7 +306,8 @@ jobs:
           mkdir -p "$PUBLIC_ROOT"
           ln -sr "$PUBLIC_ROOT" "$PUBLIC_ROOT"/dists || /bin/true
           if [ "${{ steps.gpg.conclusion }}" != "skipped" ]; then
-          cp -f /etc/apt/trusted.gpg.d/apt.bcachefs.org.asc "$PUBLIC_ROOT"
+          cp -f /etc/apt/keyrings/apt.bcachefs.org.pgp "$PUBLIC_ROOT"
+          cp -f /etc/apt/keyrings/apt.bcachefs.org.asc "$PUBLIC_ROOT"
           fi
           if [ "${{ (github.event_name == 'push' && github.ref_type == 'branch' && github.ref_name == 'master') && 'true' || 'false' }}" = "true" ]; then
           export GPG_SIGNING_SUBKEY_FINGERPRINT=${{ secrets.GPG_SIGNING_SUBKEY_FINGERPRINT }}

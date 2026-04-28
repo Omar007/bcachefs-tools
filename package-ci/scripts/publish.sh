@@ -147,6 +147,7 @@ rsync -rlpt --delay-updates "$STAGING_ROOT/" "$PUBLISH_ROOT/"
 
 # Export GPG public key so users can fetch it for apt verification
 echo "--- Exporting GPG public key ---"
+gpg --export "$GPG_SIGNING_SUBKEY_FINGERPRINT" > "$PUBLISH_ROOT/apt.bcachefs.org.pgp"
 gpg --armor --export "$GPG_SIGNING_SUBKEY_FINGERPRINT" > "$PUBLISH_ROOT/apt.bcachefs.org.asc"
 
 # Generate landing page footer (nginx fancyindex_footer)
@@ -155,7 +156,9 @@ mkdir -p "$PUBLISH_ROOT/.footer"
 cat > "$PUBLISH_ROOT/.footer/README.html" << 'FOOTER'
 <hr>
 <h2>Adding this repository</h2>
-<pre><code>wget -qO- https://apt.bcachefs.org/apt.bcachefs.org.asc | sudo tee /etc/apt/trusted.gpg.d/apt.bcachefs.org.asc
+<pre><code>sudo install -d -m 0755 /etc/apt/keyrings
+wget -qO- https://apt.bcachefs.org/apt.bcachefs.org.pgp | sudo tee /etc/apt/keyrings/apt.bcachefs.org.pgp &gt; /dev/null
+sudo chmod 0644 /etc/apt/keyrings/apt.bcachefs.org.pgp
 FOOTER
 
 # Inject the real fingerprint
@@ -170,13 +173,15 @@ Types: deb deb-src
 URIs: https://apt.bcachefs.org/unstable/
 Suites: bcachefs-tools-release
 Components: main
-Signed-By: /etc/apt/trusted.gpg.d/apt.bcachefs.org.asc
+Signed-By: /etc/apt/keyrings/apt.bcachefs.org.pgp
 SOURCES
 
 sudo apt update
 sudo apt install bcachefs-tools
 </code></pre>
 <p><strong>Note:</strong> For latest <code>git master</code> packages, replace <code>bcachefs-tools-release</code> with <code>bcachefs-tools-snapshot</code>.</p>
+<p>Stable channel: <code>Suites: bcachefs-tools-release</code></p>
+<p>Snapshot/nightly channel: <code>Suites: bcachefs-tools-snapshot</code></p>
 <p>For more information, see the <a href="https://wiki.debian.org/DebianRepository/UseThirdParty">Debian third-party repository guide</a>.</p>
 <p>Binary <code>.deb</code> packages are signed with <a href="https://manpages.debian.org/debsigs">debsigs</a>. Source artifacts can be verified using <a href="https://github.com/sigstore/rekor">Rekor</a>.</p>
 FOOTER

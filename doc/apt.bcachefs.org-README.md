@@ -1,6 +1,8 @@
 To add this repository to your computer, do:
 ```bash
-wget -qO- https://apt.bcachefs.org/apt.bcachefs.org.asc | sudo tee /etc/apt/trusted.gpg.d/apt.bcachefs.org.asc
+sudo install -d -m 0755 /etc/apt/keyrings
+wget -qO- https://apt.bcachefs.org/apt.bcachefs.org.pgp | sudo tee /etc/apt/keyrings/apt.bcachefs.org.pgp > /dev/null
+sudo chmod 0644 /etc/apt/keyrings/apt.bcachefs.org.pgp
 # Fingerprint: EA483B991020C72A8A5035ADA0620B5E0E01C1DD
 sudo tee /etc/apt/sources.list.d/apt.bcachefs.org.sources > /dev/null <<EOF
 Types: deb deb-src
@@ -8,7 +10,7 @@ URIs: https://apt.bcachefs.org/unstable/
 # Or replace unstable with your distro's release name
 Suites: bcachefs-tools-release
 Components: main
-Signed-By: /etc/apt/trusted.gpg.d/apt.bcachefs.org.asc
+Signed-By: /etc/apt/keyrings/apt.bcachefs.org.pgp
 EOF
 sudo apt update
 sudo apt install bcachefs-tools
@@ -19,15 +21,11 @@ This will give you packages for the latest release of `bcachefs-tools`.
 If you need packages for the latest `git master` commit,
 replace `bcachefs-tools-release` with `bcachefs-tools-snapshot`.
 
-Or you can use `add-apt-repository` tool. Stable channel:
-```bash
-sudo add-apt-repository "deb https://apt.bcachefs.org/unstable bcachefs-tools-release main"
-```
+Stable channel:
+`Suites: bcachefs-tools-release`
 
-If you feel like living dangerously, there's also nightly/snapshot packages:
-```bash
-sudo add-apt-repository "deb https://apt.bcachefs.org/unstable bcachefs-tools-snapshot main"
-```
+Snapshot/nightly channel:
+`Suites: bcachefs-tools-snapshot`
 
 If you want to ensure that the packages from this repository are always preferred, do:
 ```bash
