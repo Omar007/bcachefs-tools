@@ -1159,7 +1159,7 @@ static __always_inline int btree_path_down(struct btree_trans *trans,
 		return btree_node_gap_err(trans, path, &trans->btree_path_down);
 
 	b = bch2_btree_node_get(trans, path, &trans->btree_path_down,
-				level, lock_type, trace_ip);
+				level, lock_type, flags, trace_ip);
 	ret = PTR_ERR_OR_ZERO(b);
 	if (unlikely(ret))
 		return ret;
@@ -1171,9 +1171,6 @@ static __always_inline int btree_path_down(struct btree_trans *trans,
 
 	if (btree_node_read_locked(path, level + 1))
 		btree_node_unlock(trans, path, level + 1);
-
-	if (unlikely(btree_node_needs_merge(trans, b, 0)))
-		bch2_btree_node_merge_async(trans->c, b);
 
 	mark_btree_node_locked(trans, path, level,
 			       (enum btree_node_locked_type) lock_type);
@@ -2571,9 +2568,6 @@ static struct bkey_s_c __bch2_btree_iter_peek(struct btree_iter *iter, struct bp
 		if (likely(k.k)) {
 			break;
 		} else if (likely(!bpos_eq(l->b->key.k.p, SPOS_MAX))) {
-			if (btree_node_needs_merge(trans, l->b, 0))
-				bch2_btree_node_merge_async(trans->c, l->b);
-
 			/* Advance to next leaf node: */
 			search_key = bpos_successor(l->b->key.k.p);
 		} else {

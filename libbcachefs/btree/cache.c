@@ -1121,6 +1121,7 @@ static inline void btree_check_header(struct bch_fs *c, struct btree *b)
 static struct btree *__bch2_btree_node_get(struct btree_trans *trans, struct btree_path *path,
 					   const struct bkey_i *k, unsigned level,
 					   enum six_lock_type lock_type,
+					   enum btree_iter_update_trigger_flags flags,
 					   unsigned long trace_ip)
 {
 	struct bch_fs *c = trans->c;
@@ -1132,6 +1133,9 @@ static struct btree *__bch2_btree_node_get(struct btree_trans *trans, struct btr
 retry:
 	b = btree_cache_find(bc, k);
 	if (unlikely(!b)) {
+		if (unlikely(flags & BTREE_ITER_nofill))
+			return ERR_PTR(bch_err_throw(c, no_btree_node_nofill));
+
 		/*
 		 * We must have the parent locked to call bch2_btree_node_fill(),
 		 * else we could read in a btree node from disk that's been
@@ -1237,6 +1241,7 @@ retry:
 struct btree *bch2_btree_node_get(struct btree_trans *trans, struct btree_path *path,
 				  const struct bkey_i *k, unsigned level,
 				  enum six_lock_type lock_type,
+				  enum btree_iter_update_trigger_flags flags,
 				  unsigned long trace_ip)
 {
 	struct bch_fs *c = trans->c;
@@ -1256,7 +1261,7 @@ struct btree *bch2_btree_node_get(struct btree_trans *trans, struct btree_path *
 	if (unlikely(!c->opts.btree_node_mem_ptr_optimization ||
 		     !b ||
 		     b->hash_val != btree_ptr_hash_val(k)))
-		return __bch2_btree_node_get(trans, path, k, level, lock_type, trace_ip);
+		return __bch2_btree_node_get(trans, path, k, level, lock_type, flags, trace_ip);
 
 	if (btree_node_read_locked(path, level + 1))
 		btree_node_unlock(trans, path, level + 1);
@@ -1272,7 +1277,7 @@ struct btree *bch2_btree_node_get(struct btree_trans *trans, struct btree_path *
 		     race_fault())) {
 		six_unlock_type(&b->c.lock, lock_type);
 		if (bch2_btree_node_relock(trans, path, level + 1))
-			return __bch2_btree_node_get(trans, path, k, level, lock_type, trace_ip);
+			return __bch2_btree_node_get(trans, path, k, level, lock_type, flags, trace_ip);
 
 		event_inc_trace(c, trans_restart_btree_node_reused, buf, ({
 			prt_printf(&buf, "%s\n", trans->fn);
@@ -1283,7 +1288,7 @@ struct btree *bch2_btree_node_get(struct btree_trans *trans, struct btree_path *
 
 	if (unlikely(btree_node_read_in_flight(b))) {
 		six_unlock_type(&b->c.lock, lock_type);
-		return __bch2_btree_node_get(trans, path, k, level, lock_type, trace_ip);
+		return __bch2_btree_node_get(trans, path, k, level, lock_type, flags, trace_ip);
 	}
 
 	prefetch(b->aux_data);
@@ -1525,6 +1530,56 @@ int bch2_fs_btree_cache_init(struct bch_fs *c)
 	return 0;
 }
 
+/*
+ * Diagnostic for the cache_exit teardown trylocks: if the trylock fails
+ * something else is still holding intent or write on a node we expect to
+ * be quiesced. Dump everything that might identify the holder before we
+ * BUG, since there's no other forensic output for this case.
+ */
+static noinline __cold void btree_cache_exit_locked_dump(struct bch_fs *c,
+							 struct btree *b,
+							 const char *what)
+{
+	struct six_lock_count counts = six_lock_counts(&b->c.lock);
+	struct task_struct *owner = READ_ONCE(b->c.lock.owner);
+
+	CLASS(bch_log_msg, msg)(c);
+	prt_printf(&msg.m, "%s on %s node at cache_exit\n", what,
+		   b->cache_state == BTREE_NODE_CACHE_FREEABLE ? "freeable" : "live");
+	prt_printf(&msg.m, "btree=%u level=%u cache_state=%u flags=0x%lx hash_val=0x%llx\n",
+		   b->c.btree_id, b->c.level, b->cache_state, b->flags, b->hash_val);
+	prt_printf(&msg.m, "lock state=0x%x read=%u intent=%u write=%u (recurse intent=%u write=%u)\n",
+		   atomic_read(&b->c.lock.state),
+		   counts.n[SIX_LOCK_read],
+		   counts.n[SIX_LOCK_intent],
+		   counts.n[SIX_LOCK_write],
+		   b->c.lock.intent_lock_recurse,
+		   b->c.lock.write_lock_recurse);
+	if (owner)
+		bch2_prt_task_backtrace(&msg.m, owner, 0, GFP_NOWAIT);
+	else
+		prt_printf(&msg.m, "owner not recorded");
+}
+
+static void btree_cache_exit_drain_node(struct bch_fs *c,
+					struct bch_fs_btree_cache *bc,
+					struct btree *b)
+{
+	BUG_ON(btree_node_read_in_flight(b) || btree_node_write_in_flight(b));
+	if (unlikely(!six_trylock_intent(&b->c.lock))) {
+		btree_cache_exit_locked_dump(c, b, "intent held");
+		BUG();
+	}
+	if (unlikely(!six_trylock_write(&b->c.lock))) {
+		btree_cache_exit_locked_dump(c, b, "write held");
+		BUG();
+	}
+	bch2_btree_node_transition_state_locked(bc, b, BTREE_NODE_CACHE_FREED);
+	six_unlock_write(&b->c.lock);
+	six_unlock_intent(&b->c.lock);
+	cond_resched();
+}
+
 void bch2_fs_btree_cache_exit(struct bch_fs *c)
 {
 	struct bch_fs_btree_cache *bc = &c->btree.cache;
@@ -1554,28 +1609,13 @@ void bch2_fs_btree_cache_exit(struct bch_fs *c)
 			};
 			for (unsigned j = 0; j < ARRAY_SIZE(heads); j++)
 				list_for_each_entry_safe(b, t, heads[j], list) {
-					BUG_ON(btree_node_read_in_flight(b) ||
-					       btree_node_write_in_flight(b));
-					BUG_ON(!six_trylock_intent(&b->c.lock));
-					BUG_ON(!six_trylock_write(&b->c.lock));
 					clear_btree_node_permanent(b);
-					bch2_btree_node_transition_state_locked(bc, b, BTREE_NODE_CACHE_FREED);
-					six_unlock_write(&b->c.lock);
-					six_unlock_intent(&b->c.lock);
-					cond_resched();
+					btree_cache_exit_drain_node(c, bc, b);
 				}
 		}
 
-		list_for_each_entry_safe(b, t, &bc->freeable, list) {
-			BUG_ON(btree_node_read_in_flight(b) ||
-			       btree_node_write_in_flight(b));
-			BUG_ON(!six_trylock_intent(&b->c.lock));
-			BUG_ON(!six_trylock_write(&b->c.lock));
-			bch2_btree_node_transition_state_locked(bc, b, BTREE_NODE_CACHE_FREED);
-			six_unlock_write(&b->c.lock);
-			six_unlock_intent(&b->c.lock);
-			cond_resched();
-		}
+		list_for_each_entry_safe(b, t, &bc->freeable, list)
+			btree_cache_exit_drain_node(c, bc, b);
 
 		BUG_ON(!bch2_journal_error(&c->journal) &&
 		       (bc->live[0].nr_dirty || bc->live[1].nr_dirty));
