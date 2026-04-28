@@ -145,7 +145,7 @@ impl WaitInitialized {
 
     fn process_events(&mut self, socket: &udev::MonitorSocket) -> anyhow::Result<()> {
         for event in socket.iter() {
-            eprintln!("{:?}", event);
+            debug!("udev event: {event:?}");
             let Some(devnode) = event.devnode() else {
                 continue;
             };
