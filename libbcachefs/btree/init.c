@@ -343,9 +343,9 @@ int bch2_fs_btree_init(struct bch_fs *c)
 int bch2_fs_btree_init_rw(struct bch_fs *c)
 {
 	if (!(c->btree.write_submit_wq = alloc_workqueue("bcachefs_btree_write_sumit",
-				WQ_PERCPU|WQ_HIGHPRI|WQ_FREEZABLE|WQ_MEM_RECLAIM, 1)) ||
+				WQ_HIGHPRI|WQ_FREEZABLE|WQ_MEM_RECLAIM, 1)) ||
 	    !(c->btree.write_complete_wq = alloc_workqueue("bcachefs_btree_write_complete",
-				WQ_UNBOUND|WQ_HIGHPRI|WQ_FREEZABLE|WQ_MEM_RECLAIM, 512)))
+				WQ_HIGHPRI|WQ_FREEZABLE|WQ_MEM_RECLAIM, 1)))
 		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 
 	try(bch2_fs_btree_interior_update_init(c));
