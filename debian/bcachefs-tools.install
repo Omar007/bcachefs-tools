@@ -1,4 +1,5 @@
 usr/lib/udev/rules.d/64-bcachefs.rules
+usr/lib/systemd/system/bcachefs-wait-devices@.service
 usr/sbin/bcachefs
 usr/sbin/fsck.bcachefs
 usr/sbin/fsck.fuse.bcachefs
